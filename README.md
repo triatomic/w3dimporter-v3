@@ -21,6 +21,7 @@ Tested on 3ds Max 2023.
 ## Changelog (v5 vs v3.1)
 
 ### W3D material support
+
 New **Use W3D materials** checkbox. When the W3D Tools `W3DMaterial` plugin is installed, the importer builds W3DMaterials instead of Standard materials, with the following wired in from the W3D file:
 
 - **Vertex material colors** — ambient, diffuse, specular, emissive
@@ -31,37 +32,46 @@ New **Use W3D materials** checkbox. When the W3D Tools `W3DMaterial` plugin is i
 - **Defaults for fields not stored in W3D** — `stage0/1mappinguvchannel = 1`, `speculartodiffuse = off`
 
 ### Per-shader blend mode mapping
+
 Each W3D shader's `srcBlend` / `destBlend` / `alphaTest` is mapped to the matching W3DMaterial blend mode:
 
-| W3D shader | W3DMaterial blendmode |
-| --- | --- |
-| `srcBlend=ONE`, `destBlend=ZERO` | `Opaque (0)` |
-| `srcBlend=ONE`, `destBlend=ONE` | `Add (1)` |
-| `srcBlend=ZERO`, `destBlend=SRC_COLOR` | `Multiply (2)` |
-| `srcBlend=ONE`, `destBlend=SRC_COLOR` | `MultiplyAndAdd (3)` |
-| `srcBlend=ONE`, `destBlend=ONE_MINUS_SRC_COLOR` | `Screen (4)` |
-| `srcBlend=SRC_ALPHA`, `destBlend=ONE_MINUS_SRC_ALPHA` | `AlphaBlend (5)` |
-| any with `alphaTest != 0` | `AlphaTest (6)` or `AlphaTestAndBlend (7)` |
-| anything else | `Custom (8)` |
+| W3D shader                                            | W3DMaterial blendmode                      |
+| ----------------------------------------------------- | ------------------------------------------ |
+| `srcBlend=ONE`, `destBlend=ZERO`                      | `Opaque (0)`                               |
+| `srcBlend=ONE`, `destBlend=ONE`                       | `Add (1)`                                  |
+| `srcBlend=ZERO`, `destBlend=SRC_COLOR`                | `Multiply (2)`                             |
+| `srcBlend=ONE`, `destBlend=SRC_COLOR`                 | `MultiplyAndAdd (3)`                       |
+| `srcBlend=ONE`, `destBlend=ONE_MINUS_SRC_COLOR`       | `Screen (4)`                               |
+| `srcBlend=SRC_ALPHA`, `destBlend=ONE_MINUS_SRC_ALPHA` | `AlphaBlend (5)`                           |
+| any with `alphaTest != 0`                             | `AlphaTest (6)` or `AlphaTestAndBlend (7)` |
+| anything else                                         | `Custom (8)`                               |
 
 `Add`, `AlphaBlend`, and `AlphaTestAndBlend` also explicitly write `blendmodesrc`, `blendmodedest`, and force `customblendwritezbuffer = off` so the material renders correctly without manual fix-up.
 
 ### Per-sub-material blend mode picking
+
 For multi-texture meshes that build a multi-material, each sub-material now gets its own blend mode picked from the shader its faces actually reference (`pickBlendModeForSub`), instead of the whole mesh inheriting a single mesh-level mode. Fixes the bug where an opaque sub-material would inherit its parent's `Add` mode (or vice versa).
 
 Handles three matlPass encodings:
+
 - Single-shader meshes (`shaderIds.count == 1` and `shaders.count == 1`) — every sub uses the one shader.
 - Short-form multi-shader meshes (`shaderIds.count == 1` but `shaders.count > 1`) — sub `N` maps to `shaders[N]`.
 - Per-face shader meshes (`shaderIds.count > 1`) — walks the faces, collects shaders for each sub's `txIds`, and promotes toward the strongest (Add wins).
 
 ### AlphaTest detection ordering
+
 `alphaTest != 0` is now checked **before** the `srcBlend=ONE, destBlend=ZERO` opaque pattern. The W3D `SC_ATEST_2D` preset uses the same blend factors as opaque and only differs by the `alphaTest` flag, so the previous order classified alpha-test meshes as opaque. Fixed in all four classification sites.
 
 ### Ignore errors checkbox
+
 New checkbox (unchecked by default) in the import dialog. When enabled, the bit-channel animation loop skips entries whose `pivotID` is `0` or out of range, instead of erroring with `array index must be positive number, got: 0`. Use this when an asset's visibility track references `ROOTTRANSFORM` (pivotID 0) and you want the rest of the import to succeed.
 
+*NOTE: this is destructive to the model shown in the 3dsmax viewport the model will look wrong; exported model should be fine. Proceed with caution.*
+
 ### Expanded debug output
+
 The **Debug output** checkbox now also prints, per mesh:
+
 - Each shader's literal blend-mode label (Opaque / Add / Multiply / AlphaBlend / AlphaTest / etc.) alongside the raw values
 - Each vertex material's colors, opacity, translucency, shininess
 - Each vertex material's `attrs` bitfield with decoded `stage0mapping` / `stage1mapping` (integer + name)
@@ -70,6 +80,7 @@ The **Debug output** checkbox now also prints, per mesh:
 - The final W3DMaterial blendmode the mesh would receive
 
 ### Other small fixes
+
 - Stage 0 textures show in the viewport (`stage0display = on`).
 - The "alpha" / "additive" mesh classification now uses the engine's actual `Uses_Alpha()` rule (`destBlend ∈ {SRC_ALPHA, ONE_MINUS_SRC_ALPHA}` or `srcBlend ∈ {SRC_ALPHA, ONE_MINUS_SRC_ALPHA}`), matching `shader.h`.
 
