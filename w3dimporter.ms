@@ -228,7 +228,8 @@ struct W3dMesh
 	shaders,
 	vertMatls,
 	textures,
-	matlPass
+	matlPass,
+	matlPasses
 )
 
 struct HLodHeader
@@ -1103,6 +1104,7 @@ fn ReadMeshMaterialPass fstream chunkEnd=
 fn ReadMesh fstream chunkEnd =
 (
 	--bitchannels = #()
+	matlPasses = #()
 	while (ftell fstream < chunkEnd) do
 	(
 		chunkType = ReadLong fstream #unsigned
@@ -1158,6 +1160,7 @@ fn ReadMesh fstream chunkEnd =
 			0x00000038:	--W3D_CHUNK_MATERIAL_PASS	--wraps the information for a single material pass
 			(
 				matlPass = ReadMeshMaterialPass fstream subChunkEnd
+				append matlPasses matlPass
 			)
 			--0x00000058:	--W3D_CHUNK_DEFORM	// mesh deform or 'damage' information.
 			--0x00000080:	--W3D_CHUNK_PS2_SHADERS	// Shader info specific to the Playstation 2.
@@ -1174,7 +1177,7 @@ fn ReadMesh fstream chunkEnd =
 		--print ("end: " + bit.intAsHex chunkEnd)
 		------ debug end ------
 	)
-	result = W3dMesh header verts normals vertInfs faces shadeIds matlheader shaders vertMatls textures matlPass
+	result = W3dMesh header verts normals vertInfs faces shadeIds matlheader shaders vertMatls textures matlPass matlPasses
 	--return result
 )
 
@@ -1309,7 +1312,7 @@ rollout rltDepStackController "Dependencies" width:200 height:120
 
 --interface
 --utility w3dimport "Coolfile W3D Importer"
-function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput useW3DMatl ignoreErrors fixNormals tga2dds fixVertices noMultiMat =
+function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput useW3DMatl ignoreErrors fixNormals tga2dds fixVertices noMultiMat tga2ddsRev =
 (
 	-- for the interface in future version
 	userSeparateMaterial = false
@@ -1530,20 +1533,23 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 				numTextures = 0
 				if meshes[i].textures != undefined do numTextures = meshes[i].textures.count
 
-				-- Optional .tga -> .dds extension rewrite. Many W3D files reference TGA
-				-- textures that have been re-exported as DDS later; toggling this swaps just
+				-- Optional .tga <-> .dds extension rewrite. Many W3D files reference TGA
+				-- textures that have been re-exported as DDS later; toggling tga2dds swaps just
 				-- the extension (case-insensitive, name preserved) so the bitmaptex calls
 				-- and debug output below pick up the .dds versions automatically.
+				-- When tga2ddsRev is also on, the rewrite goes the other direction (.dds -> .tga).
 				if tga2dds and (meshes[i].textures != undefined) do
 				(
+					local fromExt = if tga2ddsRev then ".dds" else ".tga"
+					local toExt   = if tga2ddsRev then ".tga" else ".dds"
 					for t = 1 to meshes[i].textures.count do
 					(
 						local fn0 = meshes[i].textures[t].txFileName
 						if fn0 != undefined and fn0.count >= 4 do
 						(
 							local ext = toLower (substring fn0 (fn0.count - 3) 4)
-							if ext == ".tga" do
-								meshes[i].textures[t].txFileName = (substring fn0 1 (fn0.count - 4)) + ".dds"
+							if ext == fromExt do
+								meshes[i].textures[t].txFileName = (substring fn0 1 (fn0.count - 4)) + toExt
 						)
 					)
 				)
@@ -1617,15 +1623,33 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 						for t = 1 to meshes[i].textures.count do
 						( format "    texture[%] = %\n" t meshes[i].textures[t].txFileName )
 					)
-					if (meshes[i].matlPass != undefined) and (meshes[i].matlPass.textureStage != undefined) do
+					-- material info header (declared pass count from W3D_CHUNK_MATERIAL_INFO)
+					if meshes[i].matlheader != undefined do
+					( format "  matlheader: passCount=% vertMatlCount=% shaderCount=% textureCount=%\n" meshes[i].matlheader.passCount meshes[i].matlheader.vertMatlCount meshes[i].matlheader.shaderCount meshes[i].matlheader.textureCount )
+					-- walk every MATERIAL_PASS chunk (one per render pass)
+					local mPasses = meshes[i].matlPasses
+					if mPasses == undefined or mPasses.count == 0 then
 					(
-						if meshes[i].matlPass.textureStage.txIds != undefined then
-							format "  txIds.count = %, values = %\n" meshes[i].matlPass.textureStage.txIds.count meshes[i].matlPass.textureStage.txIds
-						else
-							format "  txIds = undefined\n"
+						if meshes[i].matlPass != undefined then ( mPasses = #(meshes[i].matlPass) ) else ( mPasses = #() )
 					)
-					if (meshes[i].matlPass != undefined) and (meshes[i].matlPass.vmIds != undefined) do
-					( format "  vmIds.count = %, values = %\n" meshes[i].matlPass.vmIds.count meshes[i].matlPass.vmIds )
+					format "  matlPasses.count = %\n" mPasses.count
+					for p = 1 to mPasses.count do
+					(
+						local mpD = mPasses[p]
+						format "  -- pass[%] --\n" p
+						if (mpD.textureStage != undefined) and (mpD.textureStage.txIds != undefined) then
+							format "    txIds.count = %, values = %\n" mpD.textureStage.txIds.count mpD.textureStage.txIds
+						else
+							format "    txIds = undefined\n"
+						if mpD.vmIds != undefined then
+							format "    vmIds.count = %, values = %\n" mpD.vmIds.count mpD.vmIds
+						else
+							format "    vmIds = undefined\n"
+						if mpD.shaderIds != undefined then
+							format "    shaderIds.count = %, values = %\n" mpD.shaderIds.count mpD.shaderIds
+						else
+							format "    shaderIds = undefined\n"
+					)
 					-- alpha diagnostics
 					format "  shaders.count = %\n" (if meshes[i].shaders != undefined then meshes[i].shaders.count else 0)
 					if meshes[i].shaders != undefined do
@@ -1730,6 +1754,23 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 						local sxSel = -1
 						if mesh.shaders.count > 1 and subIx >= 1 and subIx <= mesh.shaders.count then
 							sxSel = subIx
+						else if subIx > mesh.shaders.count then
+						(
+							-- unmapped sub beyond shader count (orphan texture not face-referenced).
+							-- Use SAGE naming convention: textures ending in "_G" are glow/Add, else Opaque base.
+							local tName = ""
+							try ( tName = mesh.textures[subIx].txFileName ) catch ()
+							if tName != undefined and tName != "" do
+							(
+								local lcName = toLower tName
+								-- strip extension
+								local dotIx = findString lcName "."
+								local baseName = lcName
+								if dotIx != undefined and dotIx > 1 do baseName = substring lcName 1 (dotIx - 1)
+								if baseName.count >= 2 and (substring baseName (baseName.count - 1) 2) == "_g" do return 1
+							)
+							sxSel = 1  -- default to first/base shader (typically Opaque)
+						)
 						else
 							sxSel = shIds[1] + 1
 						if sxSel < 1 or sxSel > mesh.shaders.count do return fallback
@@ -1898,9 +1939,167 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 					)
 				)
 
+				-- Detect "single sub-material, multi-pass" pattern (e.g. base + glow) using matlPasses:
+				-- W3D stores one MATERIAL_PASS chunk per render pass. When each pass has uniform
+				-- single-valued vmIds/txIds/shaderIds (every face uses the same triple in that pass),
+				-- the file is describing a single sub-material with N render passes -- not a multi-sub.
+				-- Build an N-sub MultiMaterial (one W3DMaterial per pass) so that on re-export the W3D
+				-- exporter writes all passes back out. Pass 2+ properties aren't writable on a single
+				-- W3DMaterial from MAXScript, so multi-sub is the round-trip workaround.
+				if (not twoStageHandled) and (meshes[i].matlPasses != undefined) and (meshes[i].matlPasses.count >= 2) and (meshes[i].shaders != undefined) and (meshes[i].vertMatls != undefined) do
+				(
+					local mPs = meshes[i].matlPasses
+					local nPasses = mPs.count
+					-- per-pass arrays of (vmIx, txIx, shIx) -- 1-based for max
+					local passVmIx = #()
+					local passTxIx = #()
+					local passShIx = #()
+					local passUniform = true
+					for p = 1 to nPasses while passUniform do
+					(
+						local pp = mPs[p]
+						if pp == undefined do ( passUniform = false; exit )
+						local tIds = undefined
+						if pp.textureStage != undefined do tIds = pp.textureStage.txIds
+						local vIds = pp.vmIds
+						local sIds = pp.shaderIds
+						-- check uniformity (or single-element short form)
+						if tIds != undefined and tIds.count > 1 do
+						( for k = 2 to tIds.count while passUniform do ( if tIds[k] != tIds[1] do passUniform = false ) )
+						if passUniform and vIds != undefined and vIds.count > 1 do
+						( for k = 2 to vIds.count while passUniform do ( if vIds[k] != vIds[1] do passUniform = false ) )
+						if passUniform and sIds != undefined and sIds.count > 1 do
+						( for k = 2 to sIds.count while passUniform do ( if sIds[k] != sIds[1] do passUniform = false ) )
+						if passUniform do
+						(
+							local txZero = if tIds != undefined and tIds.count > 0 then tIds[1] else 0
+							local vmZero = if vIds != undefined and vIds.count > 0 then vIds[1] else 0
+							local shZero = if sIds != undefined and sIds.count > 0 then sIds[1] else 0
+							append passTxIx (txZero + 1)
+							append passVmIx (vmZero + 1)
+							append passShIx (shZero + 1)
+						)
+					)
+					if passUniform and passTxIx.count == nPasses do
+					(
+						-- classify shader -> blendMode
+						fn _tpClassify sh =
+						(
+							if sh == undefined do return 0
+							if (sh.srcBlend == 2) and (sh.destBlend == 5) do return (if sh.alphaTest != 0 then 7 else 5)
+							if sh.alphaTest != 0 do return 6
+							if (sh.srcBlend == 1) and (sh.destBlend == 0) do return 0
+							if (sh.srcBlend == 1) and (sh.destBlend == 1) do return 1
+							if (sh.srcBlend == 0) and (sh.destBlend == 2) do return 2
+							if (sh.srcBlend == 1) and (sh.destBlend == 2) do return 3
+							if (sh.srcBlend == 1) and (sh.destBlend == 3) do return 4
+							return 8
+						)
+						-- build one W3DMaterial sub per pass
+						local subs = #()
+						local subNames = #()
+						local bms = #()
+						local texFiles = #()
+						local allBuilt = true
+						for p = 1 to nPasses while allBuilt do
+						(
+							local vmIx = passVmIx[p]
+							local txIx = passTxIx[p]
+							local shIx = passShIx[p]
+							if vmIx < 1 or vmIx > meshes[i].vertMatls.count do ( allBuilt = false; exit )
+							if txIx < 1 or txIx > meshes[i].textures.count do ( allBuilt = false; exit )
+							if shIx < 1 or shIx > meshes[i].shaders.count do ( allBuilt = false; exit )
+							local pVm = meshes[i].vertMatls[vmIx]
+							local pTex = meshes[i].textures[txIx].txFileName
+							local pBm = _tpClassify meshes[i].shaders[shIx]
+							local pName = pVm.vmName + "_pass" + (p as string)
+							local pSub = undefined
+							if useW3DMatl then
+							(
+								pSub = buildW3DMatl pName pVm pTex pBm
+							)
+							else
+							(
+								-- standard material per pass: alpha/additive wired from this pass's blendmode
+								local pAlpha = (pBm == 5) or (pBm == 7)
+								local pAdditive = (pBm == 1)
+								pSub = standardMaterial name:pName
+								pSub.ambient = pVm.vmInfo.ambient
+								pSub.diffuse = pVm.vmInfo.diffuse
+								pSub.specular = pVm.vmInfo.specular
+								pSub.glossiness = pVm.vmInfo.shininess * 100
+								pSub.opacity = pVm.vmInfo.opacity * 100
+								local pDiffTex = bitmaptex filename:pTex
+								try ( pDiffTex.alphaSource = 2 ) catch ()
+								pSub.diffuseMap = pDiffTex
+								showTextureMap pSub pSub.diffuseMap true
+								if pAlpha do
+								(
+									local pOpTex = bitmaptex filename:pTex
+									pOpTex.monoOutput = 1
+									pSub.opacityMap = pOpTex
+									showTextureMap pSub pSub.opacityMap true
+								)
+								if pAdditive do
+								(
+									local pAddOp = bitmaptex filename:pTex
+									pSub.opacityMap = pAddOp
+									showTextureMap pSub pSub.opacityMap true
+									local pAddSi = bitmaptex filename:pTex
+									pSub.selfIllumMap = pAddSi
+									showTextureMap pSub pSub.selfIllumMap true
+									try ( pSub.useSelfIllumColor = true ) catch ()
+								)
+							)
+							if pSub == undefined do ( allBuilt = false; exit )
+							append subs pSub
+							append subNames pName
+							append bms pBm
+							append texFiles pTex
+						)
+						if allBuilt and subs.count == nPasses do
+						(
+							local mpMulti = multiMaterial numsubs:nPasses name:meshes[i].header.meshName
+							for p = 1 to nPasses do
+							(
+								mpMulti.materialList[p] = subs[p]
+								mpMulti.names[p] = subNames[p]
+							)
+							gmMeshes[i].material = mpMulti
+							twoStageHandled = true
+
+							-- Viewport heuristic: 3ds Max multi-sub renders only one sub per face.
+							-- The W3D pass order is preserved in the material list (so re-export round-trips),
+							-- but for visual fidelity we point face matIDs at the "main" pass:
+							--   * If any pass is AlphaBlend (5) or AlphaTestAndBlend (7), prefer that
+							--     pass -- it's typically the authored building/object texture composited
+							--     onto an Opaque base/tint pass (e.g. WELL: lakedusk Opaque + cbmogwell01 AlphaBlend).
+							--   * Otherwise default to sub 1 (pass 1, the base).
+							local viewportSub = 1
+							for p = 1 to nPasses do
+							(
+								if (bms[p] == 5) or (bms[p] == 7) do ( viewportSub = p; exit )
+							)
+							if viewportSub != 1 do
+							(
+								for f = 1 to meshes[i].faces.count do
+								( setFaceMatID gmMeshes[i] f viewportSub )
+								update gmMeshes[i]
+							)
+
+							if debugOutput do
+							(
+								format "  -> %-pass MultiMaterial (viewport sub=%):\n" nPasses viewportSub
+								for p = 1 to nPasses do
+								( format "       sub[%]: tex=% blendmode=% vm=% sh=%\n" p texFiles[p] bms[p] passVmIx[p] passShIx[p] )
+							)
+						)
+					)
+				)
+
 				if twoStageHandled then
 				(
-					-- already assigned a single two-stage W3DMaterial; skip the multi-material path
+					-- already assigned a single two-stage / two-pass W3DMaterial; skip the multi-material path
 				)
 				else if numTextures > 1 then
 				(
@@ -1941,6 +2140,14 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 
 						if subMatl == undefined then
 						(
+							-- per-sub blendmode classification (same logic as W3D material path).
+							-- Without this every sub inherits the mesh-wide meshAlpha/meshAdditive flag,
+							-- which is wrong when a mesh has e.g. one Opaque base + one Add glow sub.
+							local subBlendModeS = pickBlendModeForSub meshes[i] m 0
+							local subAlpha = (subBlendModeS == 5) or (subBlendModeS == 7)
+							local subAdditive = (subBlendModeS == 1)
+							local subAlphaTest = (subBlendModeS == 6) or (subBlendModeS == 7)
+
 							subMatl = standardMaterial name:subName
 							subMatl.ambient = curVm.vmInfo.ambient
 							subMatl.diffuse = curVm.vmInfo.diffuse
@@ -1956,8 +2163,8 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 							subMatl.diffuseMap = diffuseTex
 							showTextureMap subMatl subMatl.diffuseMap true
 
-							-- if this pass uses alpha, wire opacity to the same bitmap with mono output = Alpha
-							if meshAlpha do
+							-- if this sub uses alpha, wire opacity to the same bitmap with mono output = Alpha
+							if subAlpha do
 							(
 								opTex = bitmaptex filename:meshes[i].textures[m].txFileName
 								opTex.monoOutput = 1 -- 0=RGB Intensity, 1=Alpha
@@ -1965,7 +2172,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 								showTextureMap subMatl subMatl.opacityMap true
 							)
 							-- additive blending: assign texture to opacity and self-illumination, with selfIllumColor on
-							if meshAdditive do
+							if subAdditive do
 							(
 								addOpTex = bitmaptex filename:meshes[i].textures[m].txFileName
 								subMatl.opacityMap = addOpTex
@@ -1979,6 +2186,22 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 
 								if debugOutput do
 								( format "  -> sub[%] additive: opacity+selfIllum maps wired\n" m )
+							)
+							if debugOutput do
+							(
+								local sbLabel = "Opaque"
+								case subBlendModeS of
+								(
+									1: sbLabel = "Add"
+									2: sbLabel = "Multiply"
+									3: sbLabel = "MultiplyAndAdd"
+									4: sbLabel = "Screen"
+									5: sbLabel = "AlphaBlend"
+									6: sbLabel = "AlphaTest"
+									7: sbLabel = "AlphaTestAndBlend"
+									8: sbLabel = "Custom"
+								)
+								format "  -> std sub[%] tex=% blendmode=% (%) alpha=% additive=%\n" m meshes[i].textures[m].txFileName subBlendModeS sbLabel subAlpha subAdditive
 							)
 						)
 
@@ -3237,7 +3460,8 @@ rollout rltMain "W3D Importer" width:177 height:247
 	checkbox ckbDebugOutput "Debug Output" pos:[25,102] width:127 height:15 checked:false visible:false
 	checkbox ckbIgnoreErrors "Ignore Errors" pos:[25,119] width:127 height:15 checked:false visible:false
 	checkbox ckbFixNormals "Fix Normals" pos:[25,136] width:127 height:15 checked:true visible:false
-	checkbox ckbTga2Dds "tga2DDS" pos:[25,153] width:127 height:15 checked:false visible:false tooltip:"Rewrite .tga texture references to .dds (extension only; filename preserved)"
+	checkbox ckbTga2Dds "tga2DDS" pos:[25,153] width:65 height:15 checked:false visible:false tooltip:"Rewrite .tga texture references to .dds (extension only; filename preserved)"
+	checkbox ckbTga2DdsRev "rev" pos:[92,153] width:60 height:15 checked:false enabled:false visible:false tooltip:"Reverse: rename .dds to .tga (only available while tga2DDS is enabled)"
 	checkbox ckbFixVertices "Fix Vertices" pos:[25,170] width:127 height:15 checked:false visible:false tooltip:"Per-element smoothing groups, then weld vertices at 0.01 threshold (preserves smoothing across the weld)"
 	checkbox ckbNoMultiMat "No Multi-Mat" pos:[25,187] width:127 height:15 checked:false visible:false tooltip:"Split meshes that would use a multi-material into separate meshes (one per texture), each with a single material assigned"
 
@@ -3250,11 +3474,18 @@ rollout rltMain "W3D Importer" width:177 height:247
 			(
 				w3dFiles = getFiles(fldrPath + "\\*.w3d")
 				for i=1 to w3dFiles.count do
-				( cfW3DImporter w3dFiles[i] ckbSplitDependencies.checked rbgAutoBind.state true ckbDebugOutput.checked ckbUseW3DMatl.checked ckbIgnoreErrors.checked ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked )
+				( cfW3DImporter w3dFiles[i] ckbSplitDependencies.checked rbgAutoBind.state true ckbDebugOutput.checked ckbUseW3DMatl.checked ckbIgnoreErrors.checked ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked )
 			)
 		)
 		else
-		( cfW3DImporter undefined ckbSplitDependencies.checked rbgAutoBind.state false ckbDebugOutput.checked ckbUseW3DMatl.checked ckbIgnoreErrors.checked ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked )
+		( cfW3DImporter undefined ckbSplitDependencies.checked rbgAutoBind.state false ckbDebugOutput.checked ckbUseW3DMatl.checked ckbIgnoreErrors.checked ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked )
+	)
+
+	-- enable rev only while tga2DDS is on; uncheck it when tga2DDS is turned off
+	on ckbTga2Dds changed st do
+	(
+		ckbTga2DdsRev.enabled = st
+		if not st do ckbTga2DdsRev.checked = false
 	)
 	
 	on ckbSplitDependencies changed state do
@@ -3300,6 +3531,7 @@ rollout rltMain "W3D Importer" width:177 height:247
 		ckbIgnoreErrors.visible      = not basic
 		ckbFixNormals.visible        = not basic
 		ckbTga2Dds.visible           = not basic
+		ckbTga2DdsRev.visible        = not basic
 		ckbFixVertices.visible       = not basic
 		ckbNoMultiMat.visible        = not basic
 	)

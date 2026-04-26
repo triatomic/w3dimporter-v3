@@ -14,9 +14,21 @@ Tested on 3ds Max 2023.
 2. The "W3D Importer" dialog opens. Click **Import a file** and pick a `.w3d`.
 3. The dialog has two tabs:
    - **Basic** — Split by dependencies, Auto-Bind, Auto-Bind type (max skin / w3d skin), Batch processing.
-   - **Advanced** — Use W3D Materials, Debug Output, Ignore Errors, Fix Normals, tga2DDS, Fix Vertices, No Multi-Mat.
+   - **Advanced** — Use W3D Materials, Debug Output, Ignore Errors, Fix Normals, tga2DDS (with `rev` companion), Fix Vertices, No Multi-Mat.
 
 If a runtime error inside an import leaves the dialog's buttons unresponsive, type `w3di.reload()` in the MAXScript Listener to rebuild the dialog.
+
+## Changelog (v7 vs v6)
+
+- **Multi-pass mesh support.** The importer now reads every `MATERIAL_PASS` chunk in a mesh (was discarding all but the last). Two-pass meshes get a 2-sub MultiMaterial preserving W3D pass order so re-export round-trips correctly.
+- **Viewport matches W3DView for AlphaBlend overlays.** When pass 2 is AlphaBlend, face matIDs are pointed at the AlphaBlend sub so the textured overlay shows instead of the underlay.
+- **Glow fix for true multi-sub meshes.** Standard-material multi-sub now classifies each sub independently — only `_G` glow subs get opacity+self-illum wired, base subs render normally instead of going black. Orphan textures (in the W3D table but not face-referenced) default to Opaque, with `_G`-suffix textures defaulting to Add.
+- **`rev` companion to tga2DDS.** A new `rev` checkbox sits next to tga2DDS (disabled until tga2DDS is checked). Enabling `rev` flips the rewrite direction so `.dds` references become `.tga` instead of the default `.tga` → `.dds`.
+- **Pass-aware debug log.** `=== Mesh: NAME ===` now prints `matlheader: passCount=N` and per-pass `txIds/vmIds/shaderIds` so it's clear which faces use which (vertMatl, shader, texture) per pass.
+
+### Known limitation (carried from v6)
+
+Meshes that combine a base diffuse texture with a glow texture as a second additive pass cannot be re-exported back as a true two-pass W3D, and the 3ds Max viewport cannot reproduce the engine's pass-1-then-pass-2 composite (3ds Max draws one material per face; W3D's runtime overlays multiple passes per draw). Pass 2+ of `W3DMaterial` is UI-only and not writable from MAXScript. The importer uses a multi-sub MultiMaterial as the workaround, which preserves the data structurally but exports as a multi-sub mesh rather than a multi-pass mesh. To author a true multi-pass W3DMaterial for export, the second pass must be set manually in the Material Editor.
 
 ## Changelog (v6 vs v5)
 
