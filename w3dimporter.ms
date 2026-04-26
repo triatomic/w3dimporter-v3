@@ -1872,14 +1872,17 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 							subMatl.glossiness = curVm.vmInfo.shininess * 100
 							subMatl.opacity = curVm.vmInfo.opacity * 100
 							diffuseTex = bitmaptex filename:meshes[i].textures[m].txFileName
+							-- default the diffuse bitmap to alphaSource = None so opaque meshes don't
+							-- accidentally render transparent because the .dds carries an alpha channel.
+							-- The alpha / additive branches below rely on this being None, so it's safe
+							-- to set unconditionally here.
+							try ( diffuseTex.alphaSource = 2 ) catch () -- 0=Image,1=RGB Intensity,2=None(Opaque)
 							subMatl.diffuseMap = diffuseTex
 							showTextureMap subMatl subMatl.diffuseMap true
 
 							-- if this pass uses alpha, wire opacity to the same bitmap with mono output = Alpha
 							if meshAlpha do
 							(
-								-- diffuse bitmap should ignore its own alpha so only the opacity map drives transparency
-								try ( diffuseTex.alphaSource = 2 ) catch () -- 0=Image,1=RGB Intensity,2=None(Opaque)
 								opTex = bitmaptex filename:meshes[i].textures[m].txFileName
 								opTex.monoOutput = 1 -- 0=RGB Intensity, 1=Alpha
 								subMatl.opacityMap = opTex
@@ -1965,13 +1968,15 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 						if (meshes[i].textures != undefined) and (meshes[i].textures.count > 0) then
 						(
 							diffuseTex = bitmaptex filename:meshes[i].textures[1].txFileName
+							-- default alphaSource = None so opaque meshes don't render transparent
+							-- when the bitmap carries an alpha channel (alpha/additive branches below
+							-- expect this to be None as well, so it's safe to set unconditionally).
+							try ( diffuseTex.alphaSource = 2 ) catch () -- 0=Image,1=RGB Intensity,2=None(Opaque)
 							gmMatl.diffuseMap = diffuseTex
 							showTextureMap gmMatl gmMatl.diffuseMap true
 
 							if meshAlpha do
 							(
-								-- diffuse bitmap should ignore its own alpha so only the opacity map drives transparency
-								try ( diffuseTex.alphaSource = 2 ) catch () -- 0=Image,1=RGB Intensity,2=None(Opaque)
 								opTex = bitmaptex filename:meshes[i].textures[1].txFileName
 								opTex.monoOutput = 1 -- Alpha
 								gmMatl.opacityMap = opTex
