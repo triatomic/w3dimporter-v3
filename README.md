@@ -6,22 +6,64 @@ Originally scripted by **coolfile**, edited and augmented by **NDC**, further ed
 
 Tested on 3ds Max 2023.
 
+![W3D Importer dialog](dialog.png)
+
 ## Usage
 
 1. Run `w3dimporter.ms` in 3ds Max (Scripting → Run Script).
 2. The "W3D Importer" dialog opens. Click **Import a file** and pick a `.w3d`.
-3. Optional toggles:
-   - **Split by dependencies** — break a skinned mesh into rigid sub-meshes, one per bone.
-   - **Auto-Bind** — automatically apply skinning (max skin or w3d skin).
-   - **Use W3D materials** — when the W3D Tools `W3DMaterial` plugin is installed, build native W3D materials instead of Standard materials. Falls back to Standard if the plugin is missing.
-   - **Debug output** — print per-mesh diagnostics to the MAXScript Listener.
-   - **Ignore errors** — skip invalid pivot IDs in bit-channel animation tracks instead of erroring out.
-   - **Batch processing** — import every `.w3d` in a folder.
+3. The dialog has two tabs:
+   - **Basic** — Split by dependencies, Auto-Bind, Auto-Bind type (max skin / w3d skin), Batch processing.
+   - **Advanced** — Use W3D Materials, Debug Output, Ignore Errors, Fix Normals, tga2DDS, Fix Vertices, No Multi-Mat.
+
+If a runtime error inside an import leaves the dialog's buttons unresponsive, type `w3di.reload()` in the MAXScript Listener to rebuild the dialog.
+
+## Changelog (v6 vs v5)
+
+### Two-tab dialog layout
+The import options have been split across **Basic** and **Advanced** tabs (radio-button switcher at the top of the dialog), keeping the window compact while making room for the new Advanced toggles below.
+
+### Fix Normals
+Adds an Edit Normals modifier to each imported mesh and applies the exact "Reset Normals" sequence that the user would otherwise run by hand (subobject toggle → SetSelection #{1..N} → Reset). Without this, 3ds Max ignores the W3D-supplied per-vertex normals and the model looks faceted until you reset normals manually via the W3D Tools modifier. Smoothing-group baseline is set to group 1 first so the reset has consistent input.
+
+### Fix Vertices
+For each non-skinned mesh:
+1. Clears all existing smoothing groups.
+2. Assigns one unique smoothing group per connected element (cycling 1..32 if the mesh has more than 32 elements).
+3. Welds vertices at a fixed 0.01 threshold via `meshOp.weldVertsByThreshold`.
+
+Smoothing-group flags travel with each face through the weld, so faces from the same original element stay smooth across the seam, and faces from different elements keep their hard edges. Skinned meshes (Skin / Physique on the stack) are skipped automatically because welding renumbers/removes vertices and would silently break Skin's per-vertex weight binding.
+
+### tga2DDS
+Rewrites every `.tga` extension on imported texture references to `.dds` (case-insensitive match, filename preserved). Useful when a W3D file references TGA textures that have since been re-exported as DDS.
+
+### No Multi-Mat
+Splits meshes that would otherwise become multi-materials into separate mesh objects, one per matID actually used. Each split node is built directly from the W3D source data (verts, faces, normals, txCoords) with the matching single sub-material assigned, the original transform/parent copied, and named `OriginalName [matID N]`. The original multi-material node is replaced; downstream post-processing (skin, normals reset, fix vertices, HLOD reparent) still operates correctly because `gmMeshes[i]` is rebound to the first split node.
+
+### Single material with two texture stages (auto-detect)
+When a mesh has 1 vertex material + 1 shader + 2 textures and the vertex material's `attrs` bitfield (or `vmArgs1`) signals stage-1 usage, the importer now builds a single W3DMaterial with stage 0 = texture[1] and stage 1 = texture[2] instead of splitting into a multi-material. Matches the engine's actual rendering: e.g. SHIELDS uses LinearOffset on both stages with different mapper args, and only renders correctly as a single two-stage material.
+
+### Pass / binding ordering
+Fix Vertices and Fix Normals are now deferred to run **after** the Auto-Bind pass (max skin / w3d skin). The original code ran them mid-loop, before binding, which:
+- Caused Skin to bind to a post-weld vertex topology (wrong weights).
+- Caused Skin to be stacked on top of Edit Normals, which interferes with weight calculation.
+
+With the new order: bind first, then mutate geometry/normals on top.
+
+### Default diffuse `alphaSource = None` for opaque meshes
+The Standard-material path now sets `diffuseTex.alphaSource = 2` (None) unconditionally on the diffuse bitmap, so opaque meshes don't accidentally render transparent when the bitmap carries an alpha channel. The alpha and additive branches still wire opacity maps the same way as before.
+
+### Per-sub blend mode debug + tab-aware UI
+- The per-sub-material debug line in multi-material meshes now prints the literal blend-mode label alongside the integer (`-> sub[2] tex=... picked blendmode=1 (Add)`).
+- The shader-row debug renamed `depthMask=` to `WriteZBuffer=` to match the W3DMaterial vocabulary.
+- Vertex-material debug now lists ambient/diffuse/specular/emissive on their own lines, plus opacity, translucency, shininess, and the decoded `stage0mapping` / `stage1mapping` (integer + literal name from the `W3DMaterialMappingType` enum), `stage0mappingargs` / `stage1mappingargs`, plus defaults for fields the W3D file doesn't carry (`stage0/1mappinguvchannel`, `speculartodiffuse`).
+
+### Reload helper
+Type `w3di.reload()` in the MAXScript Listener to recover from a stuck dialog after a runtime error. (The dialog's own buttons can't recover themselves because the runtime error leaves the rollout's event-handler thread hung; recovery has to come from outside the broken dialog.)
 
 ## Changelog (v5 vs v3.1)
 
 ### W3D material support
-
 New **Use W3D materials** checkbox. When the W3D Tools `W3DMaterial` plugin is installed, the importer builds W3DMaterials instead of Standard materials, with the following wired in from the W3D file:
 
 - **Vertex material colors** — ambient, diffuse, specular, emissive
@@ -113,7 +155,6 @@ texture instead of all faces collapsing onto texture[0].
 
 When the mesh's shader signals alpha usage — i.e. `alphaTest != 0`, or `srcBlend` /
 `destBlend` references `SRC_ALPHA` / `ONE_MINUS_SRC_ALPHA` — the importer:
-
 - Sets the diffuse bitmap's `alphaSource = 2` (None / Opaque) so the diffuse channel
   ignores its own alpha.
 - Wires a second instance of the same bitmap into the Opacity slot with
@@ -125,7 +166,6 @@ The detection rule mirrors `ShaderClass::Uses_Alpha()` from the engine's `shader
 
 When the mesh's shader matches the W3D `SC_ADDITIVE` preset
 (`srcBlend = ONE (1)` and `destBlend = ONE (1)`), the importer:
-
 - Wires the texture into the Opacity slot.
 - Wires the texture into the Self-Illumination slot.
 - Sets `useSelfIllumColor = true` so the self-illumination is driven by the map.
@@ -134,7 +174,6 @@ When the mesh's shader matches the W3D `SC_ADDITIVE` preset
 
 New checkbox under "Auto-Bind" in the import dialog. When enabled, every imported
 mesh prints to the Listener:
-
 - `vertMatls.count`, `textures.count`, and each texture filename
 - `txIds` and `vmIds` arrays from the material pass
 - Per-shader `srcBlend`, `destBlend`, `alphaTest`, `depthMask`, plus an `alpha=` and

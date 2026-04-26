@@ -5,6 +5,20 @@
 -- edited and augmented by NDC --
 -- edited by tria --
 
+-- Reload helper: a runtime error inside cfW3DImporter can leave the rollout's
+-- event-handler thread stuck, making every button in the dialog unresponsive.
+-- The dialog itself can't recover from this (its own handlers are dead), so
+-- recovery has to come from outside. Type `w3di.reload()` into the MAXScript
+-- Listener after a crash and it'll tear the dialog down and rebuild it from a
+-- clean state. (`w3di` is a struct used as a namespace so we can write
+-- `w3di.reload`. `w3d` itself is reserved by 3dsmax.)
+struct W3DImporterNamespace ( fn reload =
+(
+	try ( destroyDialog rltMain ) catch ()
+	createDialog rltMain
+))
+global w3di = W3DImporterNamespace()
+
 -- reference table for adaptive delta motion channels --
 deltaTable = #()
 
@@ -1295,7 +1309,7 @@ rollout rltDepStackController "Dependencies" width:200 height:120
 
 --interface
 --utility w3dimport "Coolfile W3D Importer"
-function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput useW3DMatl ignoreErrors =
+function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput useW3DMatl ignoreErrors fixNormals tga2dds fixVertices noMultiMat =
 (
 	-- for the interface in future version
 	userSeparateMaterial = false
@@ -1506,12 +1520,33 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 	
 			-- create a mesh
 			gmMeshes[i] = mesh name:meshes[i].header.meshName vertices:gmVerts faces:gmFaces
+			-- Set by the No Multi-Mat splitter when it replaces gmMeshes[i] with a split node;
+			-- guards the post-material UV/normal loops that assume the original mesh size.
+			local noMultiMatHandled = false
 			
 			-- create a new material or apply an exist one and
 			if (meshes[i].vertMatls != undefined) and (meshes[i].vertMatls.count > 0) then
 			(
 				numTextures = 0
 				if meshes[i].textures != undefined do numTextures = meshes[i].textures.count
+
+				-- Optional .tga -> .dds extension rewrite. Many W3D files reference TGA
+				-- textures that have been re-exported as DDS later; toggling this swaps just
+				-- the extension (case-insensitive, name preserved) so the bitmaptex calls
+				-- and debug output below pick up the .dds versions automatically.
+				if tga2dds and (meshes[i].textures != undefined) do
+				(
+					for t = 1 to meshes[i].textures.count do
+					(
+						local fn0 = meshes[i].textures[t].txFileName
+						if fn0 != undefined and fn0.count >= 4 do
+						(
+							local ext = toLower (substring fn0 (fn0.count - 3) 4)
+							if ext == ".tga" do
+								meshes[i].textures[t].txFileName = (substring fn0 1 (fn0.count - 4)) + ".dds"
+						)
+					)
+				)
 
 				-- W3D shader enums (from shader.h):
 				--   SrcBlend: 0=ZERO, 1=ONE, 2=SRC_ALPHA, 3=ONE_MINUS_SRC_ALPHA
@@ -1826,7 +1861,48 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 					return m
 				)
 
-				if numTextures > 1 then
+				-- Detect "single material, two texture stages" pattern:
+				-- W3D encodes this as 1 vertMatl + 1 shader + 2 textures, with the vertMatl's
+				-- attrs bitfield (or vmArgs1) signalling a stage-1 mapping. In that case the
+				-- engine renders it as one material with stage0 = textures[1] and stage1 =
+				-- textures[2] (e.g. SHIELDS: noise + gradient via LinearOffset on both stages).
+				-- Without this detection the importer would split it into a multi-material,
+				-- which is wrong because the engine never renders these as separate sub-materials.
+				local twoStageHandled = false
+				if useW3DMatl and (numTextures == 2) and (meshes[i].vertMatls.count == 1) and (meshes[i].shaders != undefined) and (meshes[i].shaders.count == 1) do
+				(
+					local tsVm = meshes[i].vertMatls[1]
+					local tsStage1Map = 0
+					if tsVm.vmInfo != undefined do
+						tsStage1Map = bit.and (bit.shift tsVm.vmInfo.attrs -16) 0xFF
+					local tsHasStage1Args = (tsVm.vmArgs1 != undefined) and (tsVm.vmArgs1 != "")
+					if (tsStage1Map != 0) or tsHasStage1Args do
+					(
+						-- buildW3DMatl writes stage 0 (texture[1]) and both stages' mapping
+						-- types/args from the vertex material; we just append stage 1's texture.
+						local tex0 = meshes[i].textures[1].txFileName
+						local tex1 = meshes[i].textures[2].txFileName
+						local tsMatl = buildW3DMatl meshes[i].header.meshName tsVm tex0 meshBlendMode
+						if tsMatl != undefined do
+						(
+							try ( setProperty tsMatl #stage1texenabled true ) catch ()
+							try ( setProperty tsMatl #stage1texturemap (bitmaptex filename:tex1) ) catch ()
+							try ( setProperty tsMatl #stage1display true ) catch ()
+							gmMeshes[i].material = tsMatl
+							twoStageHandled = true
+							if debugOutput do
+							(
+								format "  -> single W3DMaterial, two stages: stage0=% stage1=%\n" tex0 tex1
+							)
+						)
+					)
+				)
+
+				if twoStageHandled then
+				(
+					-- already assigned a single two-stage W3DMaterial; skip the multi-material path
+				)
+				else if numTextures > 1 then
 				(
 					-- build a MultiMaterial with one sub-material per texture
 					baseVm = meshes[i].vertMatls[1]
@@ -1934,6 +2010,169 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 						)
 						update gmMeshes[i]
 					)
+
+					-- "No Multi-Mat" splitter: instead of leaving the mesh with a multi-material,
+					-- split it into separate mesh objects (one per matID actually used), each
+					-- with a single material assigned. Builds every bucket as a new mesh from
+					-- the W3D source data (verts, faces, normals, txCoords) and then deletes
+					-- the original node entirely. This is more reliable than mutating the
+					-- original via meshOp.deleteFaces, which corrupts the TVFace/normal arrays
+					-- and triggers "TVFace index out of range" errors downstream.
+					if noMultiMat do
+					(
+						try
+						(
+							-- Snapshot the W3D source data for this mesh.
+							local srcVertsW = meshes[i].verts
+							local srcNormalsW = meshes[i].normals
+							local srcFacesW = meshes[i].faces -- array of W3dMeshFace (vertIds is 0-based)
+							local srcTxCoordsW = undefined
+							if (meshes[i].matlPass != undefined) and (meshes[i].matlPass.textureStage != undefined) and (meshes[i].matlPass.textureStage.txCoords != undefined) do
+								srcTxCoordsW = meshes[i].matlPass.textureStage.txCoords
+
+							-- bucket faces by matID using the live mesh's per-face IDs (these were
+							-- assigned just above from txIdList).
+							local matIdBuckets = #()
+							local matIdList2 = #()
+							for f = 1 to gmMeshes[i].numFaces do
+							(
+								local mid = getFaceMatID gmMeshes[i] f
+								local idx = findItem matIdList2 mid
+								if idx == 0 then
+								(
+									append matIdList2 mid
+									append matIdBuckets #{f}
+								)
+								else
+								(
+									matIdBuckets[idx][f] = true
+								)
+							)
+
+							if matIdList2.count > 1 then
+							(
+								local origName = gmMeshes[i].name
+								local origParent = gmMeshes[i].parent
+								local origTransform = gmMeshes[i].transform
+								local createdNames = #()
+								local createdNodes = #()
+
+								for k = 1 to matIdList2.count do
+								(
+									local mid = matIdList2[k]
+									local newName = origName + " [matID " + (mid as string) + "]"
+									local bucketFaces = matIdBuckets[k]
+
+									-- Collect this bucket's face vertex-index triples (1-based) and
+									-- the unique source vert IDs they use.
+									local usedVerts = #{}
+									local faceTris = #()
+									for f in bucketFaces do
+									(
+										-- W3D vertIds are 0-based; +1 to match MAXScript indexing.
+										local v0 = (srcFacesW[f].vertIds.x as integer) + 1
+										local v1 = (srcFacesW[f].vertIds.y as integer) + 1
+										local v2 = (srcFacesW[f].vertIds.z as integer) + 1
+										append faceTris #(f, v0, v1, v2)
+										usedVerts[v0] = true
+										usedVerts[v1] = true
+										usedVerts[v2] = true
+									)
+
+									-- Compact: only carry the verts this bucket actually uses.
+									local oldToNew = #()
+									local newVerts = #()
+									local newNormals = #()
+									for v in usedVerts do
+									(
+										append newVerts srcVertsW[v]
+										if srcNormalsW != undefined and v <= srcNormalsW.count do
+											append newNormals srcNormalsW[v]
+										oldToNew[v] = newVerts.count
+									)
+
+									local newFaces = #()
+									for tri in faceTris do
+										append newFaces [oldToNew[tri[2]], oldToNew[tri[3]], oldToNew[tri[4]]]
+
+									local newNode = undefined
+									try ( newNode = mesh name:newName vertices:newVerts faces:newFaces ) catch ()
+
+									if newNode != undefined then
+									(
+										-- per-vert normals
+										for v = 1 to newNormals.count do
+										( try ( setNormal newNode v newNormals[v] ) catch () )
+
+										-- texture vertices (UVs) — copy txCoords for the used verts.
+										if srcTxCoordsW != undefined do
+										(
+											try
+											(
+												setNumTVerts newNode newVerts.count
+												buildTVFaces newNode
+												local idxList = #()
+												for v in usedVerts do append idxList v
+												for j = 1 to idxList.count do
+												(
+													local sv = idxList[j]
+													if sv <= srcTxCoordsW.count do
+													(
+														local uv = srcTxCoordsW[sv]
+														setTVert newNode j (Point3 uv.x uv.y 0)
+													)
+												)
+												-- setTVFace expects three integer args, not a Point3.
+												for fIx = 1 to newFaces.count do
+												(
+													local nf = newFaces[fIx]
+													setTVFace newNode fIx (nf.x as integer) (nf.y as integer) (nf.z as integer)
+												)
+											) catch ()
+										)
+
+										try ( newNode.material = gmMultiMatl.materialList[mid] ) catch ()
+										try ( newNode.transform = origTransform ) catch ()
+										try ( newNode.parent = origParent ) catch ()
+										update newNode
+										append createdNames newName
+										append createdNodes newNode
+										if debugOutput do
+											format "    -> created matID % node=% (verts=% faces=%) at pos=%\n" mid newNode.name newVerts.count newFaces.count newNode.pos
+									)
+									else
+									(
+										if debugOutput do
+											format "    -> matID % FAILED to create new mesh node\n" mid
+									)
+								)
+
+								-- Replace the original in gmMeshes so downstream post-processing
+								-- (normals reset, fix vertices, HLOD reparent) operates on a real
+								-- node instead of the soon-to-be-deleted original. Pick the first
+								-- created node as the representative.
+								if createdNodes.count > 0 then
+								(
+									try ( delete gmMeshes[i] ) catch ()
+									gmMeshes[i] = createdNodes[1]
+									noMultiMatHandled = true
+								)
+
+								if debugOutput do
+									format "  -> No Multi-Mat: split [%] into % mesh(es): %\n" origName createdNames.count createdNames
+							)
+							else
+							(
+								if debugOutput do
+									format "  -> No Multi-Mat: [%] only uses 1 matID, no split needed\n" gmMeshes[i].name
+							)
+						)
+						catch
+						(
+							if debugOutput do
+								format "  -> No Multi-Mat [%]: FAILED with error: %\n" meshes[i].header.meshName (getCurrentException())
+						)
+					)
 				)
 				else
 				(
@@ -2010,7 +2249,10 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 			)
 			
 			-- map a texture at v1.02
-			if (meshes[i].matlPass != undefined) and (meshes[i].matlPass.textureStage != undefined) and (meshes[i].matlPass.textureStage.txCoords != undefined) then
+			-- Skip when No Multi-Mat already replaced gmMeshes[i] with a split node:
+			-- the split path already set up its own per-bucket UVs/normals, and the
+			-- original-sized arrays here would index out of range on the smaller node.
+			if not noMultiMatHandled and (meshes[i].matlPass != undefined) and (meshes[i].matlPass.textureStage != undefined) and (meshes[i].matlPass.textureStage.txCoords != undefined) then
 			(
 				numTVerts = meshes[i].matlPass.textureStage.txCoords.count
 				setNumTVerts gmMeshes[i] numTVerts
@@ -2021,15 +2263,28 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 				)
 				numTFaces = meshes[i].faces.count
 				buildTVFaces gmMeshes[i]
-				
+
 				for f = 1 to numTFaces do
 				( setTVFace gmMeshes[i] f gmFaces[f] )
 			)
-			
+
 			-- set vert normals at v1.03
-			for v = 1 to meshes[i].normals.count do
-			( setNormal gmMeshes[i] v meshes[i].normals[v] )
-	
+			if not noMultiMatHandled do
+			(
+				for v = 1 to meshes[i].normals.count do
+				( setNormal gmMeshes[i] v meshes[i].normals[v] )
+			)
+
+			-- Fix Vertices and Fix Normals were originally applied here, but they interfere
+			-- with the skin-binding pass that runs after this loop:
+			--   - Fix Vertices welds verts (changes vertex count) -> Skin's per-vertex
+			--     weights would address the wrong verts.
+			--   - Fix Normals adds an Edit Normals modifier, then Skin gets stacked on top
+			--     of it -> Skin sees the post-Edit-Normals topology and the weights bind
+			--     to the wrong points.
+			-- Both passes are deferred to after the skin binding loop (search for the
+			-- "deferred Fix Vertices / Fix Normals" block below).
+
 			--find the exist pivot of the mesh and replace it.
 			if (hlodSet != undefined) and (hier != undefined) then
 			(
@@ -2809,6 +3064,132 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 			)
 		)
 		
+		-- ---- deferred Fix Vertices / Fix Normals ----
+		-- Run after wwBinding / maxBinding so that Skin or W3DSkin (which were applied to
+		-- gmMeshes[m] during the binding pass) see the original topology when they bind,
+		-- and the geometry edits below sit on top of (or beneath) Skin without changing
+		-- the vert count Skin already weighted to.
+		if fixVertices do
+		(
+			for i = 1 to gmMeshes.count do
+			(
+				if gmMeshes[i] == undefined do continue
+
+				-- Skip skinned meshes: Skin's per-vertex weights are bound to specific
+				-- vertex indices, and welding renumbers/removes verts, which would
+				-- silently break the binding. Skinning is the higher-priority feature.
+				local isSkinned = false
+				try
+				(
+					for m in gmMeshes[i].modifiers while not isSkinned do
+					(
+						local cn = (classOf m) as string
+						if cn == "Skin" or cn == "Physique" do isSkinned = true
+					)
+				) catch ()
+
+				if isSkinned then
+				(
+					if debugOutput do
+						format "  -> Fix Vertices [%]: skipped (mesh has Skin/Physique; weld would break weights)\n" gmMeshes[i].name
+					continue
+				)
+
+				try
+				(
+					local vBefore = gmMeshes[i].numVerts
+					local elementId = 0
+
+					for f = 1 to gmMeshes[i].numFaces do
+						setFaceSmoothGroup gmMeshes[i] f 0
+					update gmMeshes[i]
+
+					local visited = #{}
+					for f = 1 to gmMeshes[i].numFaces do
+					(
+						if visited[f] do continue
+						elementId += 1
+						local elemFaces = meshOp.getElementsUsingFace gmMeshes[i] #{f}
+						local sg = bit.shift 1 (mod (elementId - 1) 32)
+						for ef in elemFaces do
+						(
+							setFaceSmoothGroup gmMeshes[i] ef sg
+							visited[ef] = true
+						)
+					)
+					update gmMeshes[i]
+
+					meshOp.weldVertsByThreshold gmMeshes[i] #all 0.01
+					update gmMeshes[i]
+
+					if debugOutput do
+					(
+						try
+						(
+							local vAfter = gmMeshes[i].numVerts
+							local welded = vBefore - vAfter
+							local sgSpan = if elementId <= 32 then (elementId as string) else ("32 (cycled, " + (elementId as string) + " elements)")
+							format "  -> Fix Vertices [%]: cleared SGs, found % element(s), assigned SG span=%, welded %->% verts (-% removed) at threshold 0.01\n" gmMeshes[i].name elementId sgSpan vBefore vAfter welded
+						)
+						catch ( format "  -> Fix Vertices [%]: completed but debug print failed: %\n" gmMeshes[i].name (getCurrentException()) )
+					)
+				)
+				catch
+				(
+					if debugOutput do
+						format "  -> Fix Vertices [%]: FAILED with error: %\n" gmMeshes[i].name (getCurrentException())
+				)
+			)
+		)
+
+		if fixNormals do
+		(
+			for i = 1 to gmMeshes.count do
+			(
+				if gmMeshes[i] == undefined do continue
+				try
+				(
+					-- Smoothing-group baseline write goes to the base mesh; if a modifier is
+					-- already on the stack (Skin or the Edit_Mesh from Fix Vertices), the base
+					-- mesh is locked. Wrap in try/catch and fall through — Edit Normals' Reset
+					-- still works without it, just from the modifier's own normal data.
+					try
+					(
+						for f = 1 to gmMeshes[i].numFaces do
+							setFaceSmoothGroup gmMeshes[i] f 1
+						update gmMeshes[i]
+					) catch ()
+
+					local enMod = Edit_Normals()
+					addModifier gmMeshes[i] enMod
+
+					local prevSel = selection as array
+					select gmMeshes[i]
+					max modify mode
+
+					subobjectLevel = 0
+					modPanel.setCurrentObject enMod
+					subobjectLevel = 1
+					modPanel.setCurrentObject enMod
+
+					local nrmCount = enMod.EditNormalsMod.GetNumNormals()
+					if nrmCount > 0 do
+					(
+						enMod.EditNormalsMod.SetSelection #{1..nrmCount}
+						enMod.EditNormalsMod.Reset()
+					)
+
+					subobjectLevel = 0
+
+					try
+					(
+						if prevSel.count == 0 then clearSelection() else select prevSel
+					) catch ()
+				) catch ()
+			)
+		)
+		-- ---- end deferred ----
+
 		if pickbox != undefined then
 		(
 			sName = pickbox.boxName
@@ -2836,16 +3217,29 @@ macroscript ImportW3D
 	icon:#("gMax",2)
 ( createDialog rltMain )
 
-rollout rltMain "W3D Importer" width:177 height:234
+rollout rltMain "W3D Importer" width:177 height:247
 (
 	button btnW3DImporter "Import a file" pos:[25,17] width:127 height:36
-	checkbox ckbSplitDependencies "Split by dependencies" pos:[25,65] width:127 height:15 enabled:true
-	checkbox ckbAutoBind "Auto-Bind" pos:[25,82] width:127 height:15 checked:true
-	checkbox ckbUseW3DMatl "Use W3D materials" pos:[25,99] width:127 height:15 checked:false
-	checkbox ckbDebugOutput "Debug output" pos:[25,116] width:127 height:15 checked:false
-	checkbox ckbIgnoreErrors "Ignore errors" pos:[25,133] width:127 height:15 checked:false
-	radiobuttons rbgAutoBind "Auto-Bind type" pos:[17,161] width:162 height:30 enabled:true labels:#("max skin", "w3d skin") default:1 columns:2
-	checkbox ckbBatchProcessing "Batch processing" pos:[25,197] width:127 height:15 checked:false
+
+	-- Tab strip: clicking these toggles which group of controls is visible below.
+	-- (MAXScript rollouts have no native tab control, but a radio-button strip is the
+	-- conventional substitute and behaves exactly like tabs.)
+	radiobuttons rbgTab "" pos:[12,60] width:153 height:18 labels:#("Basic", "Advanced") default:1 columns:2
+
+	-- BASIC tab controls
+	checkbox ckbSplitDependencies "Split by dependencies" pos:[25,85] width:127 height:15 enabled:true
+	checkbox ckbAutoBind "Auto-Bind" pos:[25,102] width:127 height:15 checked:true
+	radiobuttons rbgAutoBind "Auto-Bind type" pos:[17,127] width:162 height:30 enabled:true labels:#("max skin", "w3d skin") default:1 columns:2
+	checkbox ckbBatchProcessing "Batch processing" pos:[25,165] width:127 height:15 checked:false
+
+	-- ADVANCED tab controls (overlap the same vertical space; visibility toggled by rbgTab)
+	checkbox ckbUseW3DMatl "Use W3D Materials" pos:[25,85] width:127 height:15 checked:false visible:false
+	checkbox ckbDebugOutput "Debug Output" pos:[25,102] width:127 height:15 checked:false visible:false
+	checkbox ckbIgnoreErrors "Ignore Errors" pos:[25,119] width:127 height:15 checked:false visible:false
+	checkbox ckbFixNormals "Fix Normals" pos:[25,136] width:127 height:15 checked:true visible:false
+	checkbox ckbTga2Dds "tga2DDS" pos:[25,153] width:127 height:15 checked:false visible:false tooltip:"Rewrite .tga texture references to .dds (extension only; filename preserved)"
+	checkbox ckbFixVertices "Fix Vertices" pos:[25,170] width:127 height:15 checked:false visible:false tooltip:"Per-element smoothing groups, then weld vertices at 0.01 threshold (preserves smoothing across the weld)"
+	checkbox ckbNoMultiMat "No Multi-Mat" pos:[25,187] width:127 height:15 checked:false visible:false tooltip:"Split meshes that would use a multi-material into separate meshes (one per texture), each with a single material assigned"
 
 	on btnW3DImporter pressed do
 	(
@@ -2856,11 +3250,11 @@ rollout rltMain "W3D Importer" width:177 height:234
 			(
 				w3dFiles = getFiles(fldrPath + "\\*.w3d")
 				for i=1 to w3dFiles.count do
-				( cfW3DImporter w3dFiles[i] ckbSplitDependencies.checked rbgAutoBind.state true ckbDebugOutput.checked ckbUseW3DMatl.checked ckbIgnoreErrors.checked )
+				( cfW3DImporter w3dFiles[i] ckbSplitDependencies.checked rbgAutoBind.state true ckbDebugOutput.checked ckbUseW3DMatl.checked ckbIgnoreErrors.checked ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked )
 			)
 		)
 		else
-		( cfW3DImporter undefined ckbSplitDependencies.checked rbgAutoBind.state false ckbDebugOutput.checked ckbUseW3DMatl.checked ckbIgnoreErrors.checked )
+		( cfW3DImporter undefined ckbSplitDependencies.checked rbgAutoBind.state false ckbDebugOutput.checked ckbUseW3DMatl.checked ckbIgnoreErrors.checked ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked )
 	)
 	
 	on ckbSplitDependencies changed state do
@@ -2891,7 +3285,25 @@ rollout rltMain "W3D Importer" width:177 height:234
 		if ckbBatchProcessing.checked then btnW3DImporter.caption = "Import files"
 		else btnW3DImporter.caption = "Import a file"
 	)
-	
+
+	-- Tab switcher: state 1 = Basic, state 2 = Advanced.
+	on rbgTab changed st do
+	(
+		local basic = (st == 1)
+		ckbSplitDependencies.visible = basic
+		ckbAutoBind.visible          = basic
+		rbgAutoBind.visible          = basic
+		ckbBatchProcessing.visible   = basic
+
+		ckbUseW3DMatl.visible        = not basic
+		ckbDebugOutput.visible       = not basic
+		ckbIgnoreErrors.visible      = not basic
+		ckbFixNormals.visible        = not basic
+		ckbTga2Dds.visible           = not basic
+		ckbFixVertices.visible       = not basic
+		ckbNoMultiMat.visible        = not basic
+	)
+
 	on rltMain open do
 	(
 		local i
