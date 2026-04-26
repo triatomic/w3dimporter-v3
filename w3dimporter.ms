@@ -1295,7 +1295,7 @@ rollout rltDepStackController "Dependencies" width:200 height:120
 
 --interface
 --utility w3dimport "Coolfile W3D Importer"
-function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput =
+function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput useW3DMatl ignoreErrors =
 (
 	-- for the interface in future version
 	userSeparateMaterial = false
@@ -1532,14 +1532,42 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput =
 
 				-- Mesh-level rollups (inline shader scans because MAXScript disallows nested fn refs)
 				meshAlpha = false
+				meshAlphaTest = false
 				meshAdditive = false
+				-- W3DMaterial blendmode enum: 0=Opaque,1=Add,2=Multiply,3=MultiplyAndAdd,4=Screen,
+				--                              5=AlphaBlend,6=AlphaTest,7=AlphaTestAndBlend,8=Custom
+				meshBlendMode = 0 -- defaults to Opaque if no shader signals otherwise
 				if (meshes[i].shaders != undefined) and (meshes[i].shaders.count > 0) do
 				(
 					for s = 1 to meshes[i].shaders.count do
 					(
 						sh = meshes[i].shaders[s]
+						if sh.alphaTest != 0 do meshAlphaTest = true
 						if (sh.alphaTest != 0) or (sh.destBlend == 4) or (sh.destBlend == 5) or (sh.srcBlend == 2) or (sh.srcBlend == 3) do meshAlpha = true
 						if (sh.srcBlend == 1) and (sh.destBlend == 1) do meshAdditive = true
+
+						-- Derive the W3DMaterial blendmode from this shader.
+						-- IMPORTANT: alphaTest is orthogonal to blend mode in W3D, so it must be
+						-- checked BEFORE the opaque/add/etc. blend patterns. The AlphaTest preset
+						-- has the same src/dst as Opaque (ONE/ZERO) and only differs by alphaTest.
+						local thisBm = -1
+						if (sh.srcBlend == 2) and (sh.destBlend == 5) then thisBm = (if sh.alphaTest != 0 then 7 else 5) -- AlphaTestAndBlend / AlphaBlend
+						else if sh.alphaTest != 0 then thisBm = 6   -- AlphaTest (any blend, but typically ONE/ZERO)
+						else if (sh.srcBlend == 1) and (sh.destBlend == 0) then thisBm = 0   -- Opaque
+						else if (sh.srcBlend == 1) and (sh.destBlend == 1) then thisBm = 1   -- Add
+						else if (sh.srcBlend == 0) and (sh.destBlend == 2) then thisBm = 2   -- Multiply
+						else if (sh.srcBlend == 1) and (sh.destBlend == 2) then thisBm = 3   -- MultiplyAndAdd
+						else if (sh.srcBlend == 1) and (sh.destBlend == 3) then thisBm = 4   -- Screen
+						else thisBm = 8   -- Custom (unrecognised src/dst combo)
+
+						-- Promote the mesh's blend mode toward the most expressive shader.
+						-- Order of promotion: Opaque < Custom < AlphaTest < AlphaBlend < AlphaTestAndBlend < Screen < MultiplyAndAdd < Multiply < Add
+						-- (Add wins because it's the strongest visual override; this matches the precedence used elsewhere.)
+						if thisBm == 1 then meshBlendMode = 1
+						else if (meshBlendMode != 1) and (thisBm == 7) then meshBlendMode = 7
+						else if (meshBlendMode != 1) and (meshBlendMode != 7) and (thisBm == 5) then meshBlendMode = 5
+						else if (meshBlendMode != 1) and (meshBlendMode != 7) and (meshBlendMode != 5) and (thisBm == 6) then meshBlendMode = 6
+						else if (meshBlendMode == 0) and (thisBm > 0) then meshBlendMode = thisBm
 					)
 				)
 
@@ -1570,13 +1598,233 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput =
 						for s = 1 to meshes[i].shaders.count do
 						(
 							sh = meshes[i].shaders[s]
-							format "    shader[%]: srcBlend=%, destBlend=%, alphaTest=%, depthMask=%  -> alpha=%, additive=%\n" s sh.srcBlend sh.destBlend sh.alphaTest sh.depthMask (shaderUsesAlphaW3D sh) (shaderIsAdditiveW3D sh)
+							-- per-shader literal label inferred from src/dst blend (alphaTest checked first)
+							local blendLabel = "Custom"
+							if (sh.srcBlend == 2) and (sh.destBlend == 5) then blendLabel = (if sh.alphaTest != 0 then "AlphaTestAndBlend" else "AlphaBlend")
+							else if sh.alphaTest != 0 then blendLabel = "AlphaTest"
+							else if (sh.srcBlend == 1) and (sh.destBlend == 0) then blendLabel = "Opaque"
+							else if (sh.srcBlend == 1) and (sh.destBlend == 1) then blendLabel = "Add"
+							else if (sh.srcBlend == 0) and (sh.destBlend == 2) then blendLabel = "Multiply"
+							else if (sh.srcBlend == 1) and (sh.destBlend == 2) then blendLabel = "MultiplyAndAdd"
+							else if (sh.srcBlend == 1) and (sh.destBlend == 3) then blendLabel = "Screen"
+							format "    shader[%]: srcBlend=%, destBlend=%, alphaTest=%, WriteZBuffer=%  -> alpha=%, additive=%, blendMode=%\n" s sh.srcBlend sh.destBlend sh.alphaTest sh.depthMask (shaderUsesAlphaW3D sh) (shaderIsAdditiveW3D sh) blendLabel
+						)
+					)
+					-- per-vertex-material info (one entry per pass): colors + stage0/stage1 mapping types + mapper args.
+					-- W3D vmInfo.attrs encodes mapping types: bits 8-15 = stage0Mapping, bits 16-23 = stage1Mapping.
+					-- vmArgs0/vmArgs1 are the per-stage mapper args strings (match stage0mappingargs/stage1mappingargs).
+					if meshes[i].vertMatls != undefined do
+					(
+						for v = 1 to meshes[i].vertMatls.count do
+						(
+							local vmEntry = meshes[i].vertMatls[v]
+							format "    vertMatl[%]: name=%\n" v vmEntry.vmName
+							if vmEntry.vmInfo != undefined do
+							(
+								format "      ambient   = %\n" vmEntry.vmInfo.ambient
+								format "      diffuse   = %\n" vmEntry.vmInfo.diffuse
+								format "      specular  = %\n" vmEntry.vmInfo.specular
+								format "      emissive  = %\n" vmEntry.vmInfo.emissive
+								format "      opacity      = %\n" vmEntry.vmInfo.opacity
+								format "      translucency = %\n" vmEntry.vmInfo.translucency
+								format "      shininess    = %\n" vmEntry.vmInfo.shininess
+								local attrsVal = vmEntry.vmInfo.attrs
+								local stage0Map = bit.and (bit.shift attrsVal -8) 0xFF
+								local stage1Map = bit.and (bit.shift attrsVal -16) 0xFF
+								-- W3DMaterialMappingType enum (from w3dmaterial.h)
+								local mapNames = #("UV","Environment","ClassicEnvironment","Screen","LinearOffset","Silhouette","Scale","Grid","Rotate","Sine","Step","ZigZag","WSClassicEnv","WSEnvironment","GridClassicEnv","GridEnvironment","Random","Edge","BumpEnv","GridWSClassicEnv","GridWSEnv")
+								local s0Label = if (stage0Map + 1) >= 1 and (stage0Map + 1) <= mapNames.count then mapNames[stage0Map + 1] else "Unknown"
+								local s1Label = if (stage1Map + 1) >= 1 and (stage1Map + 1) <= mapNames.count then mapNames[stage1Map + 1] else "Unknown"
+								format "      attrs=0x% stage0mapping=% (%) stage1mapping=% (%)\n" (bit.intAsHex attrsVal) stage0Map s0Label stage1Map s1Label
+								-- W3D doesn't store stage0mappinguvchannel or speculartodiffuse; defaults on import.
+								format "      stage0mappinguvchannel = 1 (default; W3D file has no value)\n"
+								format "      stage1mappinguvchannel = 1 (default; W3D file has no value)\n"
+								format "      speculartodiffuse = off (default; W3D file has no value)\n"
+							)
+							if vmEntry.vmArgs0 != undefined and vmEntry.vmArgs0 != "" do
+								format "      stage0mappingargs = \"%\"\n" vmEntry.vmArgs0
+							if vmEntry.vmArgs1 != undefined and vmEntry.vmArgs1 != "" do
+								format "      stage1mappingargs = \"%\"\n" vmEntry.vmArgs1
 						)
 					)
 					format "  meshUsesAlpha = %\n" meshAlpha
+					format "  meshIsAlphaTest = %\n" meshAlphaTest
 					format "  meshIsAdditive = %\n" meshAdditive
+					-- final W3DMaterial blendmode that buildW3DMatl will set
+					local pickedLabel = "Opaque"
+					case meshBlendMode of
+					(
+						0: pickedLabel = "Opaque"
+						1: pickedLabel = "Add"
+						2: pickedLabel = "Multiply"
+						3: pickedLabel = "MultiplyAndAdd"
+						4: pickedLabel = "Screen"
+						5: pickedLabel = "AlphaBlend"
+						6: pickedLabel = "AlphaTest"
+						7: pickedLabel = "AlphaTestAndBlend"
+						8: pickedLabel = "Custom"
+					)
+					format "  W3DMaterial blendmode -> % (%)\n" meshBlendMode pickedLabel
 				)
 				------ end debug ------
+
+				-- Build a W3DMaterial (from the installed W3D Tools plugin) configured from a vertex material + texture.
+				-- Returns undefined if the W3DMaterial class is not available.
+				-- blendMode enum: 0=Opaque, 1=Add, 2=Multiply, 3=MultiplyAndAdd, 4=Screen,
+				--                 5=AlphaBlend, 6=AlphaTest, 7=AlphaTestAndBlend, 8=Custom
+				-- Pick the blend mode for sub-material `subIx` (0-based texture index in W3D, 1-based here).
+				-- Looks for a face whose txIds entry matches subIx-1, then reads that face's shader from shaderIds.
+				-- Falls back to meshBlendMode if no per-face data is present.
+				-- (shader->blendMode logic is inlined because MAXScript disallows nested fn cross-refs.)
+				fn pickBlendModeForSub mesh subIx fallback =
+				(
+					if mesh.matlPass == undefined do return fallback
+					if mesh.shaders == undefined or mesh.shaders.count == 0 do return fallback
+
+					local txIds = undefined
+					if mesh.matlPass.textureStage != undefined do txIds = mesh.matlPass.textureStage.txIds
+					local shIds = mesh.matlPass.shaderIds
+
+					if shIds == undefined or shIds.count == 0 do return fallback
+
+					-- Short-form matlPass: shaderIds has 1 entry. If the mesh actually has multiple
+					-- shaders (one per pass), map sub index -> shaders[subIx] directly; otherwise
+					-- every sub uses the single referenced shader.
+					if shIds.count == 1 do
+					(
+						local sxSel = -1
+						if mesh.shaders.count > 1 and subIx >= 1 and subIx <= mesh.shaders.count then
+							sxSel = subIx
+						else
+							sxSel = shIds[1] + 1
+						if sxSel < 1 or sxSel > mesh.shaders.count do return fallback
+						local sh = mesh.shaders[sxSel]
+						-- alphaTest must be checked before opaque/add patterns (see comment in rollup).
+						if (sh.srcBlend == 2) and (sh.destBlend == 5) do return (if sh.alphaTest != 0 then 7 else 5)
+						if sh.alphaTest != 0 do return 6
+						if (sh.srcBlend == 1) and (sh.destBlend == 0) do return 0
+						if (sh.srcBlend == 1) and (sh.destBlend == 1) do return 1
+						if (sh.srcBlend == 0) and (sh.destBlend == 2) do return 2
+						if (sh.srcBlend == 1) and (sh.destBlend == 2) do return 3
+						if (sh.srcBlend == 1) and (sh.destBlend == 3) do return 4
+						return 8
+					)
+
+					-- No per-face txIds: assume sub i uses shader i (best-effort).
+					if txIds == undefined or txIds.count <= 1 do
+					(
+						if subIx < 1 or subIx > shIds.count do return fallback
+						local sx2 = shIds[subIx] + 1
+						if sx2 < 1 or sx2 > mesh.shaders.count do return fallback
+						local sh2 = mesh.shaders[sx2]
+						if (sh2.srcBlend == 2) and (sh2.destBlend == 5) do return (if sh2.alphaTest != 0 then 7 else 5)
+						if sh2.alphaTest != 0 do return 6
+						if (sh2.srcBlend == 1) and (sh2.destBlend == 0) do return 0
+						if (sh2.srcBlend == 1) and (sh2.destBlend == 1) do return 1
+						if (sh2.srcBlend == 0) and (sh2.destBlend == 2) do return 2
+						if (sh2.srcBlend == 1) and (sh2.destBlend == 2) do return 3
+						if (sh2.srcBlend == 1) and (sh2.destBlend == 3) do return 4
+						return 8
+					)
+
+					-- Per-face txIds + per-face shaderIds: walk faces, collect blend modes used by any face whose
+					-- texture matches this sub, and promote toward the strongest expressive shader (Add wins).
+					local picked = -1
+					local target = subIx - 1
+					local n = txIds.count
+					if shIds.count < n do n = shIds.count
+					for f = 1 to n do
+					(
+						if txIds[f] != target do continue
+						local sx3 = shIds[f] + 1
+						if sx3 < 1 or sx3 > mesh.shaders.count do continue
+						local sh3 = mesh.shaders[sx3]
+						local bm = 8
+						if (sh3.srcBlend == 2) and (sh3.destBlend == 5) then bm = (if sh3.alphaTest != 0 then 7 else 5)
+						else if sh3.alphaTest != 0 then bm = 6
+						else if (sh3.srcBlend == 1) and (sh3.destBlend == 0) then bm = 0
+						else if (sh3.srcBlend == 1) and (sh3.destBlend == 1) then bm = 1
+						else if (sh3.srcBlend == 0) and (sh3.destBlend == 2) then bm = 2
+						else if (sh3.srcBlend == 1) and (sh3.destBlend == 2) then bm = 3
+						else if (sh3.srcBlend == 1) and (sh3.destBlend == 3) then bm = 4
+
+						if picked == -1 then picked = bm
+						else if bm == 1 then picked = 1
+						else if (picked != 1) and (bm == 7) then picked = 7
+						else if (picked != 1) and (picked != 7) and (bm == 5) then picked = 5
+						else if (picked != 1) and (picked != 7) and (picked != 5) and (bm == 6) then picked = 6
+						else if (picked == 0) and (bm > 0) then picked = bm
+					)
+					if picked == -1 do return fallback
+					return picked
+				)
+
+				fn buildW3DMatl matName vm texFile blendMode =
+				(
+					local m = undefined
+					try ( m = W3DMaterial name:matName ) catch ( m = undefined )
+					if m == undefined do return undefined
+
+					-- vertex material colors / opacity / shininess
+					try ( setProperty m #ambientcolour vm.vmInfo.ambient ) catch ()
+					try ( setProperty m #diffusecolour vm.vmInfo.diffuse ) catch ()
+					try ( setProperty m #specularcolour vm.vmInfo.specular ) catch ()
+					try ( setProperty m #emissivecolour vm.vmInfo.emissive ) catch ()
+					try ( setProperty m #opacity vm.vmInfo.opacity ) catch ()
+					try ( setProperty m #shininess vm.vmInfo.shininess ) catch ()
+					try ( setProperty m #translucency vm.vmInfo.translucency ) catch ()
+
+					-- stage0/stage1 mapping types come from W3D vmInfo.attrs bitfield:
+					-- bits 8-15 = stage0Mapping, bits 16-23 = stage1Mapping. The mapper-args
+					-- strings live in vmArgs0/vmArgs1.
+					if vm.vmInfo != undefined do
+					(
+						local attrsVal = vm.vmInfo.attrs
+						local stage0Map = bit.and (bit.shift attrsVal -8) 0xFF
+						local stage1Map = bit.and (bit.shift attrsVal -16) 0xFF
+						try ( setProperty m #stage0mapping stage0Map ) catch ()
+						try ( setProperty m #stage1mapping stage1Map ) catch ()
+					)
+					if vm.vmArgs0 != undefined and vm.vmArgs0 != "" do
+					( try ( setProperty m #stage0mappingargs vm.vmArgs0 ) catch () )
+					if vm.vmArgs1 != undefined and vm.vmArgs1 != "" do
+					( try ( setProperty m #stage1mappingargs vm.vmArgs1 ) catch () )
+
+					-- W3D doesn't carry these; apply sensible defaults.
+					try ( setProperty m #stage0mappinguvchannel 1 ) catch ()
+					try ( setProperty m #stage1mappinguvchannel 1 ) catch ()
+					try ( setProperty m #speculartodiffuse false ) catch ()
+
+					-- blend mode comes straight from the W3D shader classification
+					try ( setProperty m #blendmode blendMode ) catch ()
+					try ( setProperty m #alphatest (blendMode == 6 or blendMode == 7) ) catch ()
+
+					-- additive (Add): don't write to z-buffer, force alphatest off, set src/dst = One/One
+					if blendMode == 1 do
+					(
+						try ( setProperty m #customblendwritezbuffer false ) catch ()
+						try ( setProperty m #alphatest false ) catch ()
+						try ( setProperty m #blendmodesrc 1 ) catch ()  -- One
+						try ( setProperty m #blendmodedest 1 ) catch () -- One
+					)
+					-- alpha blend (5) and alpha-test+blend (7): set src/dst = SrcAlpha / OneMinusSrcAlpha
+					-- The plugin's blendmode dropdown sometimes doesn't auto-fill these; write them explicitly.
+					if (blendMode == 5) or (blendMode == 7) do
+					(
+						try ( setProperty m #customblendwritezbuffer false ) catch ()
+						try ( setProperty m #blendmodesrc 2 ) catch ()  -- SrcAlpha
+						try ( setProperty m #blendmodedest 5 ) catch () -- OneMinusSrcAlpha
+					)
+
+					-- stage 0 texture
+					if texFile != undefined and texFile != "" do
+					(
+						try ( setProperty m #stage0texenabled true ) catch ()
+						try ( setProperty m #stage0texturemap (bitmaptex filename:texFile) ) catch ()
+						try ( setProperty m #stage0display true ) catch () -- show in viewport
+					)
+					return m
+				)
 
 				if numTextures > 1 then
 				(
@@ -1591,41 +1839,68 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput =
 						curVm = meshes[i].vertMatls[vmIx]
 
 						subName = curVm.vmName + "_" + (meshes[i].textures[m].txFileName)
-						subMatl = standardMaterial name:subName
-						subMatl.ambient = curVm.vmInfo.ambient
-						subMatl.diffuse = curVm.vmInfo.diffuse
-						subMatl.specular = curVm.vmInfo.specular
-						subMatl.glossiness = curVm.vmInfo.shininess * 100
-						subMatl.opacity = curVm.vmInfo.opacity * 100
-						diffuseTex = bitmaptex filename:meshes[i].textures[m].txFileName
-						subMatl.diffuseMap = diffuseTex
-						showTextureMap subMatl subMatl.diffuseMap true
-
-						-- if this pass uses alpha, wire opacity to the same bitmap with mono output = Alpha
-						if meshAlpha do
+						subMatl = undefined
+						if useW3DMatl do
 						(
-							-- diffuse bitmap should ignore its own alpha so only the opacity map drives transparency
-							try ( diffuseTex.alphaSource = 2 ) catch () -- 0=Image,1=RGB Intensity,2=None(Opaque)
-							opTex = bitmaptex filename:meshes[i].textures[m].txFileName
-							opTex.monoOutput = 1 -- 0=RGB Intensity, 1=Alpha
-							subMatl.opacityMap = opTex
-							showTextureMap subMatl subMatl.opacityMap true
-						)
-						-- additive blending: assign texture to opacity and self-illumination, with selfIllumColor on
-						if meshAdditive do
-						(
-							addOpTex = bitmaptex filename:meshes[i].textures[m].txFileName
-							subMatl.opacityMap = addOpTex
-							showTextureMap subMatl subMatl.opacityMap true
-
-							addSiTex = bitmaptex filename:meshes[i].textures[m].txFileName
-							subMatl.selfIllumMap = addSiTex
-							showTextureMap subMatl subMatl.selfIllumMap true
-
-							try ( subMatl.useSelfIllumColor = true ) catch ()
-
+							local subBlendMode = pickBlendModeForSub meshes[i] m meshBlendMode
 							if debugOutput do
-							( format "  -> sub[%] additive: opacity+selfIllum maps wired\n" m )
+							(
+								local subBmLabel = "Opaque"
+								case subBlendMode of
+								(
+									0: subBmLabel = "Opaque"
+									1: subBmLabel = "Add"
+									2: subBmLabel = "Multiply"
+									3: subBmLabel = "MultiplyAndAdd"
+									4: subBmLabel = "Screen"
+									5: subBmLabel = "AlphaBlend"
+									6: subBmLabel = "AlphaTest"
+									7: subBmLabel = "AlphaTestAndBlend"
+									8: subBmLabel = "Custom"
+								)
+								format "  -> sub[%] tex=% picked blendmode=% (%)\n" m meshes[i].textures[m].txFileName subBlendMode subBmLabel
+							)
+							subMatl = buildW3DMatl subName curVm meshes[i].textures[m].txFileName subBlendMode
+						)
+
+						if subMatl == undefined then
+						(
+							subMatl = standardMaterial name:subName
+							subMatl.ambient = curVm.vmInfo.ambient
+							subMatl.diffuse = curVm.vmInfo.diffuse
+							subMatl.specular = curVm.vmInfo.specular
+							subMatl.glossiness = curVm.vmInfo.shininess * 100
+							subMatl.opacity = curVm.vmInfo.opacity * 100
+							diffuseTex = bitmaptex filename:meshes[i].textures[m].txFileName
+							subMatl.diffuseMap = diffuseTex
+							showTextureMap subMatl subMatl.diffuseMap true
+
+							-- if this pass uses alpha, wire opacity to the same bitmap with mono output = Alpha
+							if meshAlpha do
+							(
+								-- diffuse bitmap should ignore its own alpha so only the opacity map drives transparency
+								try ( diffuseTex.alphaSource = 2 ) catch () -- 0=Image,1=RGB Intensity,2=None(Opaque)
+								opTex = bitmaptex filename:meshes[i].textures[m].txFileName
+								opTex.monoOutput = 1 -- 0=RGB Intensity, 1=Alpha
+								subMatl.opacityMap = opTex
+								showTextureMap subMatl subMatl.opacityMap true
+							)
+							-- additive blending: assign texture to opacity and self-illumination, with selfIllumColor on
+							if meshAdditive do
+							(
+								addOpTex = bitmaptex filename:meshes[i].textures[m].txFileName
+								subMatl.opacityMap = addOpTex
+								showTextureMap subMatl subMatl.opacityMap true
+
+								addSiTex = bitmaptex filename:meshes[i].textures[m].txFileName
+								subMatl.selfIllumMap = addSiTex
+								showTextureMap subMatl subMatl.selfIllumMap true
+
+								try ( subMatl.useSelfIllumColor = true ) catch ()
+
+								if debugOutput do
+								( format "  -> sub[%] additive: opacity+selfIllum maps wired\n" m )
+							)
 						)
 
 						gmMultiMatl.materialList[m] = subMatl
@@ -1664,6 +1939,21 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput =
 
 					if userSeparateMaterial or (sceneMaterials[matlName] == undefined) then
 					(
+						-- Try W3D Tools material first when requested
+						if useW3DMatl do
+						(
+							local texFile = ""
+							if (meshes[i].textures != undefined) and (meshes[i].textures.count > 0) do
+							( texFile = meshes[i].textures[1].txFileName )
+							gmMatl = buildW3DMatl matlName meshes[i].vertMatls[1] texFile meshBlendMode
+						)
+
+						if gmMatl != undefined then
+						(
+							append sceneMaterials gmMatl
+						)
+						else
+						(
 						gmMatl = standardMaterial name:matlName
 						gmMatl.ambient = meshes[i].vertMatls[1].vmInfo.ambient
 						gmMatl.diffuse = meshes[i].vertMatls[1].vmInfo.diffuse
@@ -1704,6 +1994,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput =
 							)
 						)
 						append sceneMaterials gmMatl
+						)  -- end inner else (standardMaterial fallback)
 					)
 					else
 					(
@@ -2039,6 +2330,11 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput =
 			(
 				curChn = anim.bitchannels[i]
 				-- curObj = execute ("$'" + hier.pivots[curChn.pivotID].pivotName + "'") -- at v1.02. it should be curChn.pivotID + 1 at v1.04
+				-- pivotID == 0 = ROOTTRANSFORM (not in gmPivots). With Ignore errors on, skip out-of-range pivots cleanly.
+				if ignoreErrors do
+				(
+					if curChn.pivotID < 1 or curChn.pivotID > gmPivots.count do continue
+				)
 				curObj = gmPivots[curChn.pivotID] -- test at v1.04
 				if curObj != undefined then
 				(
@@ -2535,14 +2831,16 @@ macroscript ImportW3D
 	icon:#("gMax",2)
 ( createDialog rltMain )
 
-rollout rltMain "W3D Importer" width:177 height:200
+rollout rltMain "W3D Importer" width:177 height:234
 (
 	button btnW3DImporter "Import a file" pos:[25,17] width:127 height:36
 	checkbox ckbSplitDependencies "Split by dependencies" pos:[25,65] width:127 height:15 enabled:true
 	checkbox ckbAutoBind "Auto-Bind" pos:[25,82] width:127 height:15 checked:true
-	checkbox ckbDebugOutput "Debug output" pos:[25,99] width:127 height:15 checked:false
-	radiobuttons rbgAutoBind "Auto-Bind type" pos:[17,127] width:162 height:30 enabled:true labels:#("max skin", "w3d skin") default:1 columns:2
-	checkbox ckbBatchProcessing "Batch processing" pos:[25,163] width:127 height:15 checked:false
+	checkbox ckbUseW3DMatl "Use W3D materials" pos:[25,99] width:127 height:15 checked:false
+	checkbox ckbDebugOutput "Debug output" pos:[25,116] width:127 height:15 checked:false
+	checkbox ckbIgnoreErrors "Ignore errors" pos:[25,133] width:127 height:15 checked:false
+	radiobuttons rbgAutoBind "Auto-Bind type" pos:[17,161] width:162 height:30 enabled:true labels:#("max skin", "w3d skin") default:1 columns:2
+	checkbox ckbBatchProcessing "Batch processing" pos:[25,197] width:127 height:15 checked:false
 
 	on btnW3DImporter pressed do
 	(
@@ -2553,11 +2851,11 @@ rollout rltMain "W3D Importer" width:177 height:200
 			(
 				w3dFiles = getFiles(fldrPath + "\\*.w3d")
 				for i=1 to w3dFiles.count do
-				( cfW3DImporter w3dFiles[i] ckbSplitDependencies.checked rbgAutoBind.state true ckbDebugOutput.checked )
+				( cfW3DImporter w3dFiles[i] ckbSplitDependencies.checked rbgAutoBind.state true ckbDebugOutput.checked ckbUseW3DMatl.checked ckbIgnoreErrors.checked )
 			)
 		)
 		else
-		( cfW3DImporter undefined ckbSplitDependencies.checked rbgAutoBind.state false ckbDebugOutput.checked )
+		( cfW3DImporter undefined ckbSplitDependencies.checked rbgAutoBind.state false ckbDebugOutput.checked ckbUseW3DMatl.checked ckbIgnoreErrors.checked )
 	)
 	
 	on ckbSplitDependencies changed state do
@@ -2593,11 +2891,26 @@ rollout rltMain "W3D Importer" width:177 height:200
 	(
 		local i
 		deltaTable = #()
-		
+
 		for i=1 to 16 do
 		( append deltaTable (pow 10 (float(i)-7)) ) -- Technically needs to be i-9, but Max rounds 10^(-8) and 10^(-7) to 0
 		for i=1 to 240 do
 		( append deltaTable (1-sin(float(i-1)/240*90)) )
+
+		-- Detect whether the W3D Tools material plugin is registered. If not, disable the checkbox.
+		local w3dMatlAvailable = false
+		try
+		(
+			local probe = W3DMaterial()
+			if probe != undefined do w3dMatlAvailable = true
+		)
+		catch ( w3dMatlAvailable = false )
+		ckbUseW3DMatl.enabled = w3dMatlAvailable
+		if not w3dMatlAvailable do
+		(
+			ckbUseW3DMatl.checked = false
+			ckbUseW3DMatl.caption = "Use W3D materials (not installed)"
+		)
 	)
 )
 createDialog rltMain
