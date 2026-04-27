@@ -14,9 +14,34 @@ Tested on 3ds Max 2023.
 2. The "W3D Importer" dialog opens. Click **Import a file** and pick a `.w3d`.
 3. The dialog has two tabs:
    - **Basic** — Split by dependencies, Auto-Bind, Auto-Bind type (max skin / w3d skin), Batch processing.
-   - **Advanced** — Use W3D Materials, Debug Output, Ignore Errors, Fix Normals, tga2DDS (with `rev` companion), Fix Vertices, No Multi-Mat.
+   - **Advanced** — Use W3D Materials, Debug Output, Strict Mode, Fix Normals, tga2DDS (with `rev` companion), Fix Vertices, No Multi-Mat.
 
 If a runtime error inside an import leaves the dialog's buttons unresponsive, type `w3di.reload()` in the MAXScript Listener to rebuild the dialog.
+
+## Changelog (v8 vs v7)
+
+**Highlight: animation import fixed.** Models with bit-channel visibility animation now round-trip correctly through 3ds Max — they render correctly in 3ds Max, in W3DView, and in-game.
+
+### Bit-channel visibility import bug
+
+The bit-channel handler created an `On_Off` controller with a single key at frame 0 with value `1`. With 3ds Max's default playable timeline starting at frame 1, that controller evaluates to `false` across the entire timeline (verified: `at time 1f (b.visibility)` returned `false`). On re-export, `node->GetVisibility(t)` reported the bone as hidden at every frame, baking "hidden everywhere" into the bit channel — making the round-tripped model **completely invisible in-game**.
+
+The handler now:
+- **Pre-scans the channel** and only creates an `On_Off` controller when the bit data actually changes. Constant "always visible" channels leave `.visibility` as the static default, which matches the conventional 3ds Max workflow and lets the exporter fall back to its `floatvis = 1.0` default.
+- **No longer seeds a frame-0 key** for animated channels; keys go directly at the transition frames.
+- **Places transition keys at frame `f`** instead of `f+1`, removing the off-by-one frame shift that showed up as `frames=0..150` instead of `frames=1..150` in re-export dumps.
+- **Uses `.value`** instead of `.selected` for `On_Off` keys (the correct property — `.selected` is scene-selection state, not the key's value).
+
+As a side effect, the 39 spurious `ANIM_CHANNEL_VIS` motion channels that re-exports were producing alongside the bit channels also disappear: they only get emitted when `GetVisibility` returns non-`1.0` values, which the broken `On_Off` was causing on every frame.
+
+### "Ignore Errors" → "Strict Mode"
+
+The Advanced-tab `Ignore Errors` checkbox is renamed to `Strict Mode` and the polarity inverted:
+
+- **Strict Mode off (default)** — `pivotID == 0` (ROOTTRANSFORM, by design not in the scene-bone array) and out-of-range pivot IDs are silently skipped. Matches what the motion-channel loop already did via `try`/`catch` for the same condition.
+- **Strict Mode on** — the importer halts on a bad pivot ID, for users who want to be told when something is malformed.
+
+The previous default (`Ignore Errors` unchecked) caused the importer to abort on the very first bit channel of any file containing a `W3D_CHUNK_BIT_CHANNEL` for `pivotID == 0` (root visibility, present in many files), with the message *"array index must be positive number, got: 0"*.
 
 ## Changelog (v7 vs v6)
 

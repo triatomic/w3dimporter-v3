@@ -2813,7 +2813,8 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 			(
 				curChn = anim.bitchannels[i]
 				-- curObj = execute ("$'" + hier.pivots[curChn.pivotID].pivotName + "'") -- at v1.02. it should be curChn.pivotID + 1 at v1.04
-				-- pivotID == 0 = ROOTTRANSFORM (not in gmPivots). With Ignore errors on, skip out-of-range pivots cleanly.
+				-- pivotID == 0 = ROOTTRANSFORM (not in gmPivots). Skip out-of-range
+				-- pivots cleanly unless Strict Mode is enabled by the user.
 				if ignoreErrors do
 				(
 					if curChn.pivotID < 1 or curChn.pivotID > gmPivots.count do continue
@@ -2826,27 +2827,53 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 						0x0000: --BIT_CHANNEL_VIS = 0	// turn meshes on and off depending on anim frame.
 						(
 							defVal = (curChn.defaultVal > 0)
-							curObj.visibility = defVal
-							curObj.visibility.controller = On_Off()
-							curKey = addNewKey curObj.visibility.controller 0
-							curKey.selected = defVal
-							prevVal = defVal
+							-- A single On_Off key at frame 0 evaluates to "off" across
+							-- the playable timeline (1..N), which on re-export bakes
+							-- "hidden everywhere" into the bit channel and makes the
+							-- model invisible in-game. Pre-scan to detect whether the
+							-- channel is constant; if so, leave .visibility static and
+							-- don't create any controller at all - the exporter then
+							-- defaults to "always visible" which matches the file.
+							hasTransition = false
 							byteIdx = 1
 							bitIdx = 1
-							for f = curChn.firstFrame to curChn.lastFrame do
+							for f = curChn.firstFrame to curChn.lastFrame while not hasTransition do
 							(
 								curVal = bit.get (curChn.values[byteIdx]) bitIdx
-								if curVal != prevVal then
-								(
-									curKey = addNewKey curObj.visibility.controller (f + 1)
-									curKey.selected = curVal
-									prevVal = curVal
-								)
+								if curVal != defVal then hasTransition = true
 								bitIdx += 1
 								if bitIdx > 8 then
 								(
 									byteIdx += 1
-									bitIdx = 1							
+									bitIdx = 1
+								)
+							)
+							if not hasTransition then
+							(
+								curObj.visibility = defVal
+							)
+							else
+							(
+								curObj.visibility = defVal
+								curObj.visibility.controller = On_Off()
+								prevVal = defVal
+								byteIdx = 1
+								bitIdx = 1
+								for f = curChn.firstFrame to curChn.lastFrame do
+								(
+									curVal = bit.get (curChn.values[byteIdx]) bitIdx
+									if curVal != prevVal then
+									(
+										curKey = addNewKey curObj.visibility.controller f
+										curKey.value = curVal
+										prevVal = curVal
+									)
+									bitIdx += 1
+									if bitIdx > 8 then
+									(
+										byteIdx += 1
+										bitIdx = 1
+									)
 								)
 							)
 							--curKey = addNewKey curObj.visibility.controller (curChn.lastFrame + 1)
@@ -3458,7 +3485,7 @@ rollout rltMain "W3D Importer" width:177 height:247
 	-- ADVANCED tab controls (overlap the same vertical space; visibility toggled by rbgTab)
 	checkbox ckbUseW3DMatl "Use W3D Materials" pos:[25,85] width:127 height:15 checked:false visible:false
 	checkbox ckbDebugOutput "Debug Output" pos:[25,102] width:127 height:15 checked:false visible:false
-	checkbox ckbIgnoreErrors "Ignore Errors" pos:[25,119] width:127 height:15 checked:false visible:false
+	checkbox ckbIgnoreErrors "Strict Mode" pos:[25,119] width:127 height:15 checked:false visible:false tooltip:"Halt the import if a channel references an invalid pivot ID, instead of skipping it."
 	checkbox ckbFixNormals "Fix Normals" pos:[25,136] width:127 height:15 checked:true visible:false
 	checkbox ckbTga2Dds "tga2DDS" pos:[25,153] width:65 height:15 checked:false visible:false tooltip:"Rewrite .tga texture references to .dds (extension only; filename preserved)"
 	checkbox ckbTga2DdsRev "rev" pos:[92,153] width:60 height:15 checked:false enabled:false visible:false tooltip:"Reverse: rename .dds to .tga (only available while tga2DDS is enabled)"
@@ -3474,11 +3501,11 @@ rollout rltMain "W3D Importer" width:177 height:247
 			(
 				w3dFiles = getFiles(fldrPath + "\\*.w3d")
 				for i=1 to w3dFiles.count do
-				( cfW3DImporter w3dFiles[i] ckbSplitDependencies.checked rbgAutoBind.state true ckbDebugOutput.checked ckbUseW3DMatl.checked ckbIgnoreErrors.checked ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked )
+				( cfW3DImporter w3dFiles[i] ckbSplitDependencies.checked rbgAutoBind.state true ckbDebugOutput.checked ckbUseW3DMatl.checked (not ckbIgnoreErrors.checked) ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked )
 			)
 		)
 		else
-		( cfW3DImporter undefined ckbSplitDependencies.checked rbgAutoBind.state false ckbDebugOutput.checked ckbUseW3DMatl.checked ckbIgnoreErrors.checked ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked )
+		( cfW3DImporter undefined ckbSplitDependencies.checked rbgAutoBind.state false ckbDebugOutput.checked ckbUseW3DMatl.checked (not ckbIgnoreErrors.checked) ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked )
 	)
 
 	-- enable rev only while tga2DDS is on; uncheck it when tga2DDS is turned off
