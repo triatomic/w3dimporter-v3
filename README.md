@@ -7,9 +7,14 @@ Originally scripted by **coolfile**, edited and augmented by **NDC**, further ed
 Tested on 3ds Max 2023.
 
 - [w3dimporter](#w3dimporter)
+  - [Usage](#usage)
+  - [Changelog (v10 vs v8)](#changelog-v10-vs-v8)
+  - [Changelog (v8 vs v7)](#changelog-v8-vs-v7)
     - [Bit-channel visibility import bug](#bit-channel-visibility-import-bug)
     - ["Ignore Errors" → "Strict Mode"](#ignore-errors--strict-mode)
+  - [Changelog (v7 vs v6)](#changelog-v7-vs-v6)
     - [Known limitation (carried from v6)](#known-limitation-carried-from-v6)
+  - [Changelog (v6 vs v5)](#changelog-v6-vs-v5)
     - [Two-tab dialog layout](#two-tab-dialog-layout)
     - [Fix Normals](#fix-normals)
     - [Fix Vertices](#fix-vertices)
@@ -20,6 +25,7 @@ Tested on 3ds Max 2023.
     - [Default diffuse `alphaSource = None` for opaque meshes](#default-diffuse-alphasource--none-for-opaque-meshes)
     - [Per-sub blend mode debug + tab-aware UI](#per-sub-blend-mode-debug--tab-aware-ui)
     - [Reload helper](#reload-helper)
+  - [Changelog (v5 vs v3.1)](#changelog-v5-vs-v31)
     - [W3D material support](#w3d-material-support)
     - [Per-shader blend mode mapping](#per-shader-blend-mode-mapping)
     - [Per-sub-material blend mode picking](#per-sub-material-blend-mode-picking)
@@ -28,10 +34,12 @@ Tested on 3ds Max 2023.
     - [Expanded debug output](#expanded-debug-output)
     - [Other small fixes](#other-small-fixes)
     - [Known limitation: no multi-pass W3DMaterial output](#known-limitation-no-multi-pass-w3dmaterial-output)
+  - [Changelog (v3.1 vs v2.0)](#changelog-v31-vs-v20)
     - [Multi-texture meshes](#multi-texture-meshes)
     - [Alpha textures](#alpha-textures)
     - [Additive textures](#additive-textures)
     - [Debug output toggle](#debug-output-toggle)
+  - [License](#license)
 
 ![W3D Importer dialog](dialog.png)
 
