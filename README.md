@@ -67,7 +67,7 @@ If a runtime error inside an import leaves the dialog's buttons unresponsive, ty
   skeleton — like "GDIRIFLEMAN_SKL". The importer normally tries to find
   GDIRIFLEMAN_SKL.w3d sitting next to the mesh and load bones from there. If it
   can't find it, it pops up a file picker.
-- **Added "Use2023WWSkin"**  checkbox which is very similar to the basic use w3d skin but with some
+- **Added "Use2023WWSkin"**  checkbox which is very similar to the basic use w3d skin but with some changes.
 - **Multi-pass W3DMaterial Limitation Removed.** The hard limitation preventing the creation of true multi-pass W3DMaterials (which previously forced multi-texture/multi-shader meshes into 3ds Max multi-materials) has been completely resolved. True multi-pass W3DMaterials are now generated natively. *Requires the updated exporter/tools from [https://github.com/triatomic/max2w3d](https://github.com/triatomic/max2w3d).*
 - **Various bugfixes.**
 
