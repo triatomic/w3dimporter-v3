@@ -6,9 +6,39 @@ Originally scripted by **coolfile**, edited and augmented by **NDC**, further ed
 
 Tested on 3ds Max 2023.
 
+- [w3dimporter](#w3dimporter)
+    - [Bit-channel visibility import bug](#bit-channel-visibility-import-bug)
+    - ["Ignore Errors" → "Strict Mode"](#ignore-errors--strict-mode)
+    - [Known limitation (carried from v6)](#known-limitation-carried-from-v6)
+    - [Two-tab dialog layout](#two-tab-dialog-layout)
+    - [Fix Normals](#fix-normals)
+    - [Fix Vertices](#fix-vertices)
+    - [tga2DDS](#tga2dds)
+    - [No Multi-Mat](#no-multi-mat)
+    - [Single material with two texture stages (auto-detect)](#single-material-with-two-texture-stages-auto-detect)
+    - [Pass / binding ordering](#pass--binding-ordering)
+    - [Default diffuse `alphaSource = None` for opaque meshes](#default-diffuse-alphasource--none-for-opaque-meshes)
+    - [Per-sub blend mode debug + tab-aware UI](#per-sub-blend-mode-debug--tab-aware-ui)
+    - [Reload helper](#reload-helper)
+    - [W3D material support](#w3d-material-support)
+    - [Per-shader blend mode mapping](#per-shader-blend-mode-mapping)
+    - [Per-sub-material blend mode picking](#per-sub-material-blend-mode-picking)
+    - [AlphaTest detection ordering](#alphatest-detection-ordering)
+    - [Ignore errors checkbox](#ignore-errors-checkbox)
+    - [Expanded debug output](#expanded-debug-output)
+    - [Other small fixes](#other-small-fixes)
+    - [Known limitation: no multi-pass W3DMaterial output](#known-limitation-no-multi-pass-w3dmaterial-output)
+    - [Multi-texture meshes](#multi-texture-meshes)
+    - [Alpha textures](#alpha-textures)
+    - [Additive textures](#additive-textures)
+    - [Debug output toggle](#debug-output-toggle)
+
 ![W3D Importer dialog](dialog.png)
 
-## Usage
+---
+
+<details id="usage">
+<summary><h2>Usage</h2></summary>
 
 1. Run `w3dimporter.ms` in 3ds Max (Scripting → Run Script).
 2. The "W3D Importer" dialog opens. Click **Import a file** and pick a `.w3d`.
@@ -18,7 +48,25 @@ Tested on 3ds Max 2023.
 
 If a runtime error inside an import leaves the dialog's buttons unresponsive, type `w3di.reload()` in the MAXScript Listener to rebuild the dialog.
 
-## Changelog (v8 vs v7)
+</details>
+
+<details id="changelog-v10-vs-v8">
+<summary><h2>Changelog (v10 vs v8)</h2></summary>
+
+- **WWSKIN Ported.** Support for importing legacy WWSKIN skin;bones has been ported and integrated.
+- **External Skeleton**.  W3D files don't always carry their own bones. A character .w3d (e.g.
+  usinftroop.w3d) typically contains only meshes + an HLOD chunk that names a
+  skeleton — like "GDIRIFLEMAN_SKL". The importer normally tries to find
+  GDIRIFLEMAN_SKL.w3d sitting next to the mesh and load bones from there. If it
+  can't find it, it pops up a file picker.
+- **Added "Use2023WWSkin"**  checkbox which is very similar to the basic use w3d skin but with some
+- **Multi-pass W3DMaterial Limitation Removed.** The hard limitation preventing the creation of true multi-pass W3DMaterials (which previously forced multi-texture/multi-shader meshes into 3ds Max multi-materials) has been completely resolved. True multi-pass W3DMaterials are now generated natively. *Requires the updated exporter/tools from [https://github.com/triatomic/max2w3d](https://github.com/triatomic/max2w3d).*
+- **Various bugfixes.**
+
+</details>
+
+<details id="changelog-v8-vs-v7">
+<summary><h2>Changelog (v8 vs v7)</h2></summary>
 
 **Highlight: animation import fixed.** Models with bit-channel visibility animation now round-trip correctly through 3ds Max — they render correctly in 3ds Max, in W3DView, and in-game.
 
@@ -43,7 +91,10 @@ The Advanced-tab `Ignore Errors` checkbox is renamed to `Strict Mode` and the po
 
 The previous default (`Ignore Errors` unchecked) caused the importer to abort on the very first bit channel of any file containing a `W3D_CHUNK_BIT_CHANNEL` for `pivotID == 0` (root visibility, present in many files), with the message *"array index must be positive number, got: 0"*.
 
-## Changelog (v7 vs v6)
+</details>
+
+<details id="changelog-v7-vs-v6">
+<summary><h2>Changelog (v7 vs v6)</h2></summary>
 
 - **Multi-pass mesh support.** The importer now reads every `MATERIAL_PASS` chunk in a mesh (was discarding all but the last). Two-pass meshes get a 2-sub MultiMaterial preserving W3D pass order so re-export round-trips correctly.
 - **Viewport matches W3DView for AlphaBlend overlays.** When pass 2 is AlphaBlend, face matIDs are pointed at the AlphaBlend sub so the textured overlay shows instead of the underlay.
@@ -53,9 +104,14 @@ The previous default (`Ignore Errors` unchecked) caused the importer to abort on
 
 ### Known limitation (carried from v6)
 
+> **Resolved in v10:** True multi-pass W3DMaterials are now fully supported. Requires the updated tools from [https://github.com/triatomic/max2w3d](https://github.com/triatomic/max2w3d).
+
 Meshes that combine a base diffuse texture with a glow texture as a second additive pass cannot be re-exported back as a true two-pass W3D, and the 3ds Max viewport cannot reproduce the engine's pass-1-then-pass-2 composite (3ds Max draws one material per face; W3D's runtime overlays multiple passes per draw). Pass 2+ of `W3DMaterial` is UI-only and not writable from MAXScript. The importer uses a multi-sub MultiMaterial as the workaround, which preserves the data structurally but exports as a multi-sub mesh rather than a multi-pass mesh. To author a true multi-pass W3DMaterial for export, the second pass must be set manually in the Material Editor.
 
-## Changelog (v6 vs v5)
+</details>
+
+<details id="changelog-v6-vs-v5">
+<summary><h2>Changelog (v6 vs v5)</h2></summary>
 
 ### Two-tab dialog layout
 The import options have been split across **Basic** and **Advanced** tabs (radio-button switcher at the top of the dialog), keeping the window compact while making room for the new Advanced toggles below.
@@ -98,7 +154,10 @@ The Standard-material path now sets `diffuseTex.alphaSource = 2` (None) uncondit
 ### Reload helper
 Type `w3di.reload()` in the MAXScript Listener to recover from a stuck dialog after a runtime error. (The dialog's own buttons can't recover themselves because the runtime error leaves the rollout's event-handler thread hung; recovery has to come from outside the broken dialog.)
 
-## Changelog (v5 vs v3.1)
+</details>
+
+<details id="changelog-v5-vs-v31">
+<summary><h2>Changelog (v5 vs v3.1)</h2></summary>
 
 ### W3D material support
 New **Use W3D materials** checkbox. When the W3D Tools `W3DMaterial` plugin is installed, the importer builds W3DMaterials instead of Standard materials, with the following wired in from the W3D file:
@@ -165,6 +224,8 @@ The **Debug output** checkbox now also prints, per mesh:
 
 ### Known limitation: no multi-pass W3DMaterial output
 
+> **Resolved in v10:** True multi-pass W3DMaterials are now fully supported. Requires the updated tools from [https://github.com/triatomic/max2w3d](https://github.com/triatomic/max2w3d).
+
 The W3DMaterial plugin supports up to 4 passes per material, with each pass holding its own texture, blend mode, and shader settings. The W3D file format encodes this as multiple shader entries per mesh — e.g. an "Opaque base + Additive glow" mesh ships two shaders and two textures meant to render in two passes on a single material.
 
 **The importer cannot produce multi-pass W3DMaterials.** This is a hard limitation imposed by how the W3DMaterial plugin exposes itself to MAXScript, not a missing feature in the importer:
@@ -179,7 +240,10 @@ This was confirmed empirically by walking the material's exposed surface during 
 
 If you need to preserve multi-pass W3DMaterials, you have to author/edit them by hand in 3ds Max after import.
 
-## Changelog (v3.1 vs v2.0)
+</details>
+
+<details id="changelog-v31-vs-v20">
+<summary><h2>Changelog (v3.1 vs v2.0)</h2></summary>
 
 ### Multi-texture meshes
 
@@ -219,6 +283,11 @@ mesh prints to the Listener:
 
 Useful for diagnosing why a particular asset isn't getting alpha or additive wiring.
 
-## License
+</details>
+
+<details id="license">
+<summary><h2>License</h2></summary>
 
 Original script © coolfile. Modifications released under the same terms.
+
+</details>
