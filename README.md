@@ -8,6 +8,8 @@ Tested on 3ds Max 2023.
 
 - [w3dimporter](#w3dimporter)
   - [Usage](#usage)
+  - [Changelog (v11 vs v10)](#changelog-v11-vs-v10)
+    - [Use 3dsMax8 Normals](#use-3dsmax8-normals)
   - [Changelog (v10 vs v8)](#changelog-v10-vs-v8)
   - [Changelog (v8 vs v7)](#changelog-v8-vs-v7)
     - [Bit-channel visibility import bug](#bit-channel-visibility-import-bug)
@@ -16,7 +18,6 @@ Tested on 3ds Max 2023.
     - [Known limitation (carried from v6)](#known-limitation-carried-from-v6)
   - [Changelog (v6 vs v5)](#changelog-v6-vs-v5)
     - [Two-tab dialog layout](#two-tab-dialog-layout)
-    - [Use 3dsMax8 Normals](#use-3dsmax8-normals)
     - [Fix Normals](#fix-normals)
     - [Fix Vertices](#fix-vertices)
     - [tga2DDS](#tga2dds)
@@ -59,14 +60,19 @@ If a runtime error inside an import leaves the dialog's buttons unresponsive, ty
 
 </details>
 
-<details id="changelog-v10-vs-v8">
-<summary><h2>Changelog (v10 vs v8)</h2></summary>
+<details id="changelog-v11-vs-v10">
+<summary><h2>Changelog (v11 vs v10)</h2></summary>
 
 ### Use 3dsMax8 Normals
 
 New **Use 3dsMax8 Normals** checkbox (Advanced tab, on by default). After import, promotes the per-vertex normals written from the W3D file to Explicit in the base mesh's `MeshNormalSpec` via the `wwMakeNormalsExplicit` primitive in the rebuilt `max2w3d.dle`. Without this, Max 2023's Nitrous renderer re-derives normals from smoothing groups, making imported meshes look different from Max 8 (which used the legacy `RVertex/RNormal` path directly).
 
 Mutually exclusive with Fix Normals (the UI enforces this). Skinned meshes (Skin / Physique on the modifier stack) are skipped automatically — the Skin modifier recomputes normals on evaluation and discards the base mesh's explicit normals. Requires the rebuilt `max2w3d.dle`.
+
+</details>
+
+<details id="changelog-v10-vs-v8">
+<summary><h2>Changelog (v10 vs v8)</h2></summary>
 
 - **WWSKIN Ported.** Support for importing legacy WWSKIN skin;bones has been ported and integrated.
 - **External Skeleton**.  W3D files don't always carry their own bones. A character .w3d (e.g.
