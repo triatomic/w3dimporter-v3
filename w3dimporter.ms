@@ -1321,7 +1321,7 @@ rollout rltDepStackController "Dependencies" width:200 height:120
 
 --interface
 --utility w3dimport "Coolfile W3D Importer"
-function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput useW3DMatl ignoreErrors fixNormals tga2dds fixVertices noMultiMat tga2ddsRev useWWSkin externalSkelFile =
+function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput useW3DMatl ignoreErrors fixNormals tga2dds fixVertices noMultiMat tga2ddsRev useWWSkin externalSkelFile use3dsMax8Normals =
 (
 	-- Bump this when editing the script so you can confirm Max is running the expected copy.
 	-- Bump alongside any non-trivial logic change so the debug log makes the loaded version obvious.
@@ -1953,6 +1953,38 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 						local nm = (baseName + suffix) as Name
 						try ( setProperty m nm value ) catch ()
 					)
+					-- Pick the best pass for viewport display.
+					-- Priority 1: stage0 mapping == UV (0). Priority 2 (tiebreaker): opaque blend mode (0).
+					-- A pass without a stage0 texture is skipped; stage1-only passes are never chosen.
+					local displayPassIdx = 0
+					local displayPassIsUV = false
+					local displayPassIsOpaque = false
+					for p = 1 to nPasses do
+					(
+						if texList[p] != undefined and texList[p] != "" do
+						(
+							local vm = vmList[p]
+							local stage0Map = 0
+							if vm.vmInfo != undefined do
+								stage0Map = bit.and (bit.shift vm.vmInfo.attrs -16) 0xFF
+							local isUV = (stage0Map == 0)
+							local isOpaque = (bmList[p] == 0)
+							local isBetter = (displayPassIdx == 0)
+							if not isBetter do
+							(
+								if isUV and not displayPassIsUV then
+									isBetter = true
+								else if isUV and displayPassIsUV and isOpaque and not displayPassIsOpaque then
+									isBetter = true
+							)
+							if isBetter do
+							(
+								displayPassIdx = p
+								displayPassIsUV = isUV
+								displayPassIsOpaque = isOpaque
+							)
+						)
+					)
 					for p = 1 to nPasses do
 					(
 						local sfx = suffixes[p]
@@ -2002,13 +2034,13 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 						(
 							setP m "stage0texenabled" sfx true
 							setP m "stage0texturemap" sfx (bitmaptex filename:tex0)
-							setP m "stage0display" sfx true
+							if p == displayPassIdx do
+								setP m "stage0display" sfx true
 						)
 						if tex1 != undefined and tex1 != "" do
 						(
 							setP m "stage1texenabled" sfx true
 							setP m "stage1texturemap" sfx (bitmaptex filename:tex1)
-							setP m "stage1display" sfx true
 						)
 					)
 					format "    [buildMultiPassW3DMatl] OK matName=% nPasses=%\n" matName nPasses
@@ -2108,7 +2140,6 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 						(
 							try ( setProperty tsMatl #stage1texenabled true ) catch ()
 							try ( setProperty tsMatl #stage1texturemap (bitmaptex filename:tex1) ) catch ()
-							try ( setProperty tsMatl #stage1display true ) catch ()
 							gmMeshes[i].material = tsMatl
 							twoStageHandled = true
 							if debugOutput do
@@ -2283,7 +2314,6 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 								(
 									try ( setProperty pSub #stage1texenabled true ) catch ()
 									try ( setProperty pSub #stage1texturemap (bitmaptex filename:pTex1) ) catch ()
-									try ( setProperty pSub #stage1display true ) catch ()
 								)
 							)
 							else
@@ -3859,6 +3889,52 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 			)
 		)
 
+		-- "Use 3dsMax8 Normals": promote the per-vertex normals written by the setNormal
+		-- loop (line ~2982) to Explicit so Nitrous renders them as-is. Without this,
+		-- Max 2023's MeshNormalSpec pipeline treats them as Unspecified/Specified and
+		-- re-derives from smoothing groups, which is what makes imported meshes look wrong
+		-- vs Max 8 (where the legacy RVertex/RNormal path used per-vertex normals
+		-- directly). Calls the wwMakeNormalsExplicit primitive in the rebuilt max2w3d.dle
+		-- — writes the base mesh's MeshNormalSpec directly, no Edit_Normals modifier
+		-- left on the stack, no Skin/topology conflict. Mutually exclusive with Fix
+		-- Normals; the UI enforces that, but we also guard with `not fixNormals` here.
+		if use3dsMax8Normals and (not fixNormals) do
+		(
+			for i = 1 to gmMeshes.count do
+			(
+				if gmMeshes[i] == undefined do continue
+
+				local isSkinned = false
+				try
+				(
+					for m in gmMeshes[i].modifiers while not isSkinned do
+					(
+						local cn = (classOf m) as string
+						if cn == "Skin" or cn == "Physique" do isSkinned = true
+					)
+				) catch ()
+
+				if isSkinned then
+				(
+					if debugOutput do
+						format "  -> wwMakeNormalsExplicit [%]: skipped (mesh has Skin/Physique; Skin recomputes normals on evaluation, explicit base-mesh normals are discarded)\n" gmMeshes[i].name
+					continue
+				)
+
+				try
+				(
+					wwMakeNormalsExplicit gmMeshes[i]
+					if debugOutput do
+						format "  -> wwMakeNormalsExplicit [%]: OK\n" gmMeshes[i].name
+				)
+				catch
+				(
+					if debugOutput do
+						format "  -> wwMakeNormalsExplicit [%]: FAILED (rebuilt max2w3d.dle required): %\n" gmMeshes[i].name (getCurrentException())
+				)
+			)
+		)
+
 		if fixNormals do
 		(
 			for i = 1 to gmMeshes.count do
@@ -3953,14 +4029,15 @@ rollout rltMain "W3D Importer" width:177 height:275
 	checkbox ckbUseW3DMatl "Use W3D Materials" pos:[25,85] width:127 height:15 checked:false visible:false
 	checkbox ckbDebugOutput "Debug Output" pos:[25,102] width:127 height:15 checked:false visible:false
 	checkbox ckbIgnoreErrors "Strict Mode" pos:[25,119] width:127 height:15 checked:false visible:false tooltip:"Halt the import if a channel references an invalid pivot ID, instead of skipping it."
-	checkbox ckbFixNormals "Fix Normals" pos:[25,136] width:127 height:15 checked:true visible:false
-	checkbox ckbTga2Dds "tga2DDS" pos:[25,153] width:65 height:15 checked:false visible:false tooltip:"Rewrite .tga texture references to .dds (extension only; filename preserved)"
-	checkbox ckbTga2DdsRev "rev" pos:[92,153] width:60 height:15 checked:false enabled:false visible:false tooltip:"Reverse: rename .dds to .tga (only available while tga2DDS is enabled)"
-	checkbox ckbFixVertices "Fix Vertices" pos:[25,170] width:127 height:15 checked:false visible:false tooltip:"Per-element smoothing groups, then weld vertices at 0.01 threshold (preserves smoothing across the weld)"
-	checkbox ckbNoMultiMat "No Multi-Mat" pos:[25,187] width:127 height:15 checked:false visible:false tooltip:"Split meshes that would use a multi-material into separate meshes (one per texture), each with a single material assigned"
-	checkbox ckbUseWWSkin "Use 2023WWSkin" pos:[25,204] width:127 height:15 checked:false visible:false tooltip:"Bind skinned meshes using the 2023-toolchain WWSkin (Westwood Space Warp + WWSkin Binding) instead of Max's native Skin modifier. Requires the rebuilt max2w3d.dle (Phase 1+ of the WWSkin port)."
-	checkbox ckbUseExternalSkel "Use External Skeleton" pos:[25,221] width:127 height:15 checked:false visible:false tooltip:"Load the bone hierarchy from an external .w3d file (e.g. a shared skeleton) instead of the main w3d / auto-derive."
-	button btnSelectSkeleton "Select Skeleton" pos:[25,238] width:152 height:18 enabled:false visible:false
+	checkbox ckbUse3dsMax8Normals "Use 3dsMax8 Normals" pos:[25,136] width:127 height:15 checked:true visible:false tooltip:"Preserve W3D normals by marking them Explicit in MeshNormalSpec (the way Max 8 used to). Requires the rebuilt max2w3d.dle (provides the wwMakeNormalsExplicit primitive). Mutually exclusive with Fix Normals."
+	checkbox ckbFixNormals "Fix Normals" pos:[25,153] width:127 height:15 checked:false visible:false tooltip:"Destructive fallback for W3D files with broken normals: forces all faces to one smoothing group, then resets normals via Edit_Normals. Mutually exclusive with Use 3dsMax8 Normals."
+	checkbox ckbTga2Dds "tga2DDS" pos:[25,170] width:65 height:15 checked:false visible:false tooltip:"Rewrite .tga texture references to .dds (extension only; filename preserved)"
+	checkbox ckbTga2DdsRev "rev" pos:[92,170] width:60 height:15 checked:false enabled:false visible:false tooltip:"Reverse: rename .dds to .tga (only available while tga2DDS is enabled)"
+	checkbox ckbFixVertices "Fix Vertices" pos:[25,187] width:127 height:15 checked:false visible:false tooltip:"Per-element smoothing groups, then weld vertices at 0.01 threshold (preserves smoothing across the weld)"
+	checkbox ckbNoMultiMat "No Multi-Mat" pos:[25,204] width:127 height:15 checked:false visible:false tooltip:"Split meshes that would use a multi-material into separate meshes (one per texture), each with a single material assigned"
+	checkbox ckbUseWWSkin "Use 2023WWSkin" pos:[25,221] width:127 height:15 checked:false visible:false tooltip:"Bind skinned meshes using the 2023-toolchain WWSkin (Westwood Space Warp + WWSkin Binding) instead of Max's native Skin modifier. Requires the rebuilt max2w3d.dle (Phase 1+ of the WWSkin port)."
+	checkbox ckbUseExternalSkel "Use External Skeleton" pos:[25,238] width:127 height:15 checked:false visible:false tooltip:"Load the bone hierarchy from an external .w3d file (e.g. a shared skeleton) instead of the main w3d / auto-derive."
+	button btnSelectSkeleton "Select Skeleton" pos:[25,255] width:152 height:18 enabled:false visible:false
 
 	-- Path to the user-picked external skeleton w3d. Lives at rollout scope
 	-- so it survives across multiple imports without re-prompting.
@@ -3975,11 +4052,11 @@ rollout rltMain "W3D Importer" width:177 height:275
 			(
 				w3dFiles = getFiles(fldrPath + "\\*.w3d")
 				for i=1 to w3dFiles.count do
-				( cfW3DImporter w3dFiles[i] ckbSplitDependencies.checked rbgAutoBind.state true ckbDebugOutput.checked ckbUseW3DMatl.checked (not ckbIgnoreErrors.checked) ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked ckbUseWWSkin.checked (if ckbUseExternalSkel.checked then externalSkeletonFile else undefined) )
+				( cfW3DImporter w3dFiles[i] ckbSplitDependencies.checked rbgAutoBind.state true ckbDebugOutput.checked ckbUseW3DMatl.checked (not ckbIgnoreErrors.checked) ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked ckbUseWWSkin.checked (if ckbUseExternalSkel.checked then externalSkeletonFile else undefined) ckbUse3dsMax8Normals.checked )
 			)
 		)
 		else
-		( cfW3DImporter undefined ckbSplitDependencies.checked rbgAutoBind.state false ckbDebugOutput.checked ckbUseW3DMatl.checked (not ckbIgnoreErrors.checked) ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked ckbUseWWSkin.checked (if ckbUseExternalSkel.checked then externalSkeletonFile else undefined) )
+		( cfW3DImporter undefined ckbSplitDependencies.checked rbgAutoBind.state false ckbDebugOutput.checked ckbUseW3DMatl.checked (not ckbIgnoreErrors.checked) ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked ckbUseWWSkin.checked (if ckbUseExternalSkel.checked then externalSkeletonFile else undefined) ckbUse3dsMax8Normals.checked )
 	)
 
 	-- enable rev only while tga2DDS is on; uncheck it when tga2DDS is turned off
@@ -3987,6 +4064,18 @@ rollout rltMain "W3D Importer" width:177 height:275
 	(
 		ckbTga2DdsRev.enabled = st
 		if not st do ckbTga2DdsRev.checked = false
+	)
+
+	-- Use 3dsMax8 Normals and Fix Normals are mutually exclusive: enabling one
+	-- disables the other so the importer never has both code paths competing for
+	-- the same normals (one preserves, the other resets).
+	on ckbUse3dsMax8Normals changed st do
+	(
+		if st do ckbFixNormals.checked = false
+	)
+	on ckbFixNormals changed st do
+	(
+		if st do ckbUse3dsMax8Normals.checked = false
 	)
 	
 	on ckbSplitDependencies changed state do
@@ -4078,6 +4167,7 @@ rollout rltMain "W3D Importer" width:177 height:275
 		ckbUseW3DMatl.visible        = not basic
 		ckbDebugOutput.visible       = not basic
 		ckbIgnoreErrors.visible      = not basic
+		ckbUse3dsMax8Normals.visible = not basic
 		ckbFixNormals.visible        = not basic
 		ckbTga2Dds.visible           = not basic
 		ckbTga2DdsRev.visible        = not basic
