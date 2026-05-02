@@ -6,6 +6,8 @@ Originally scripted by **coolfile**, edited and augmented by **NDC**, further ed
 
 Tested on 3ds Max 2023.
 
+> **Note:** versions after v8 require the modified W3D Tools (rebuilt `max2w3d.dle`) from [https://github.com/triatomic/max2w3d](https://github.com/triatomic/max2w3d) to function properly.
+
 ![W3D Importer dialog](dialog.png)
 
 - [w3dimporter](#w3dimporter)
