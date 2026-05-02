@@ -8,6 +8,12 @@ Tested on 3ds Max 2023.
 
 - [w3dimporter](#w3dimporter)
   - [Usage](#usage)
+  - [Changelog (v17 vs v11)](#changelog-v17-vs-v11)
+    - [Import extended W3D Info](#import-extended-w3d-info)
+    - [Pivots dropdown (Basic tab)](#pivots-dropdown-basic-tab)
+    - [External skeleton popup](#external-skeleton-popup)
+    - [Use 3dsMax8 Normals now works on WWSkin meshes](#use-3dsmax8-normals-now-works-on-wwskin-meshes)
+    - [Credits](#credits)
   - [Changelog (v11 vs v10)](#changelog-v11-vs-v10)
     - [Use 3dsMax8 Normals](#use-3dsmax8-normals)
   - [Changelog (v10 vs v8)](#changelog-v10-vs-v8)
@@ -57,6 +63,37 @@ Tested on 3ds Max 2023.
    - **Advanced** — Use W3D Materials, Debug Output, Strict Mode, Fix Normals, tga2DDS (with `rev` companion), Fix Vertices, No Multi-Mat.
 
 If a runtime error inside an import leaves the dialog's buttons unresponsive, type `w3di.reload()` in the MAXScript Listener to rebuild the dialog.
+
+</details>
+
+<details id="changelog-v17-vs-v11">
+<summary><h2>Changelog (v17 vs v11)</h2></summary>
+
+### Import extended W3D Info
+
+New **Import extended W3D Info** checkbox (Advanced tab, off by default). When enabled, each imported mesh has its W3D Tools panel populated from the source `W3D_MESH_HEADER3.Attributes` and `SortLevel`: Geometry Type (Normal / CamParallel / Skin / AABox / OBBox / CamOriented / CamZOriented), geometry flags (Hide, 2-Sided, CastShadow, Shatter, Tangents, Prelit, AlwaysDynLight), collision flags (Physical / Projectile / Vis / Camera / Vehicle), and Static Sort Level. W3DBOX collision boxes get the same decode (Aligned / Oriented + collision bits). Without this pass, imported meshes always read back as the default (Normal, no flags) regardless of what the source `.w3d` encoded. Requires the rebuilt `max2w3d.dle` (provides `wwSetFlags` / `wwSetSorting`).
+
+### Pivots dropdown (Basic tab)
+
+New **Pivots:** dropdown on the Basic tab to control how hierarchy pivots are represented in the scene:
+
+- **Bone (default)** — original importer behaviour, Max bone object.
+- **Sphere** — V1.16-style green sphere. Visually distinctive but `max2w3d.dle` treats it as render geometry, so the exporter / Select Bones won't classify it as a bone — beware.
+- **Point Helper** — small helper marker. Uses `HELPER_CLASS_ID`, so W3D Tools' Select Bones picks it up as a bone and it stays out of the geometry export. Recommended alternative when bones are visually noisy.
+
+Sphere / Point Helper marker sizes auto-scale from the imported meshes' bbox diagonal (~2% / ~4%, with a sensible floor) so they stay readable across infantry, vehicles, and structures without a per-import scale knob.
+
+### External skeleton popup
+
+When the HLOD header references an external rig (HTree name differs from the HLOD name and ends in `_SKL`, the W3D convention for standalone skeleton files), the importer now surfaces a message box naming the expected skeleton — matching the V1.16 reference importer's behaviour. Fires regardless of whether the auto-derive step located the rig on disk; the import succeeds either way, but the popup makes the dependency obvious for infantry models (which always declare an HTree).
+
+### Use 3dsMax8 Normals now works on WWSkin meshes
+
+The `wwMakeNormalsExplicit` skip list is narrowed to native **Skin / Physique** only. Previously WWSkin was skipped too. The rebuilt `SkinModifierClass::ModifyObject` in `max2w3d.dle` now (a) sets `MESH_NORMAL_MODIFIER_SUPPORT` so Max doesn't auto-clear Explicit normals, and (b) re-skins each Explicit base-mesh normal by `Inverse(baseTM) * curTM` of its driving bone every evaluation, so explicit normals follow the rig instead of staying frozen in bind pose. Skin / Physique still recompute normals on evaluation and discard explicit base-mesh normals, so they remain skipped.
+
+### Credits
+
+Header comment updated to credit **Seagle & Sloth** for the v11→v17 contributions.
 
 </details>
 

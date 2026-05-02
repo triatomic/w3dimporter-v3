@@ -4,6 +4,7 @@
 -- msn: coolfile_cn@hotmail.com --
 -- edited and augmented by NDC --
 -- edited by tria --
+-- credits: Seagle & Sloth --
 
 -- Reload helper: a runtime error inside cfW3DImporter can leave the rollout's
 -- event-handler thread stuck, making every button in the dialog unresponsive.
@@ -760,6 +761,45 @@ fn ReadCompressedAnimation fstream chunkEnd =
 	--return result
 )
 
+-- Decode a raw W3D_MESH_HEADER3.Attributes (or W3DBOX.Attributes) word into a list
+-- of human-readable W3D Tools property names. Used by the "Import extended W3D
+-- Info" debug log so the user can see exactly which bits the .w3d encoded and
+-- which properties wwSetFlags / wwSetSorting will toggle on the imported nodes.
+-- Constants mirror src\scripts\w3d.h.
+fn cfDecodeW3DAttrs a =
+(
+	local parts = #()
+	local gt = bit.and a 0x00FF0000	-- W3D_MESH_FLAG_GEOMETRY_TYPE_MASK
+	case gt of
+	(
+		0x00000000:	append parts "GeomType=Normal"
+		0x00010000:	append parts "GeomType=CamParal"
+		0x00020000:	append parts "GeomType=Skin"
+		0x00040000:	append parts "GeomType=AABox"
+		0x00050000:	append parts "GeomType=OBBox"
+		0x00060000:	append parts "GeomType=CamOrient"
+		0x00070000:	append parts "GeomType=CamZOrient"
+		default:	append parts ("GeomType=0x" + (bit.intAsHex gt))
+	)
+	if (bit.and a 0x00001000) != 0 do append parts "Hide"
+	if (bit.and a 0x00002000) != 0 do append parts "TwoSided"
+	if (bit.and a 0x00008000) != 0 do append parts "CastShadow"
+	if (bit.and a 0x10000000) != 0 do append parts "Shatter"
+	if (bit.and a 0x20000000) != 0 do append parts "Tangents"
+	if (bit.and a 0x40000000) != 0 do append parts "Prelit"
+	if (bit.and a 0x80000000) != 0 do append parts "AlwaysDynLight"
+	-- Collision bits (W3D_MESH_FLAG_COLLISION_TYPE_MASK = 0x00000FF0).
+	if (bit.and a 0x00000010) != 0 do append parts "Coll:Physical"
+	if (bit.and a 0x00000020) != 0 do append parts "Coll:Projectile"
+	if (bit.and a 0x00000040) != 0 do append parts "Coll:Vis"
+	if (bit.and a 0x00000080) != 0 do append parts "Coll:Camera"
+	if (bit.and a 0x00000100) != 0 do append parts "Coll:Vehicle"
+	-- W3DBOX-only attribute bits.
+	if (bit.and a 0x00000001) != 0 do append parts "Box:Aligned"
+	if (bit.and a 0x00000002) != 0 do append parts "Box:Oriented"
+	return parts
+)
+
 fn ReadMeshHeader fstream =
 (
 	version = ReadLong fstream #unsigned
@@ -1321,11 +1361,11 @@ rollout rltDepStackController "Dependencies" width:200 height:120
 
 --interface
 --utility w3dimport "Coolfile W3D Importer"
-function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput useW3DMatl ignoreErrors fixNormals tga2dds fixVertices noMultiMat tga2ddsRev useWWSkin externalSkelFile use3dsMax8Normals =
+function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput useW3DMatl ignoreErrors fixNormals tga2dds fixVertices noMultiMat tga2ddsRev useWWSkin externalSkelFile use3dsMax8Normals importExtendedW3D pivotType =
 (
 	-- Bump this when editing the script so you can confirm Max is running the expected copy.
 	-- Bump alongside any non-trivial logic change so the debug log makes the loaded version obvious.
-	local importerVersion = "v10"
+	local importerVersion = "v17"
 	if debugOutput do
 	(
 		format "=================================================\n"
@@ -1483,7 +1523,34 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 			------ debug end ------
 		)
 		fclose fstream
-		
+
+		-- HLOD header carries the name of the rig the meshes were authored
+		-- against. We only treat it as "needs an external skeleton" when:
+		--   * the HTree name differs from the HLOD's own Name (a name that
+		--     matches the HLOD name means the rig lives inside this same w3d,
+		--     no external file required), AND
+		--   * the HTree name ends in "_SKL" (W3D convention for a standalone
+		--     skeleton file -- e.g. "S_GDIINF_SKL").
+		-- Anything else (e.g. terrain props pointing at themselves, or files
+		-- with a non-_SKL hier reference) skips the popup.
+		local hlodHTreeName = undefined
+		if hlodSet != undefined and hlodSet.header != undefined do
+		(
+			local hn = hlodSet.header.hierarchyName
+			local hlodN = hlodSet.header.hlodName
+			if hn != undefined and (hn as string) != "" do
+			(
+				local hnStr   = hn as string
+				local hlodStr = if hlodN == undefined then "" else (hlodN as string)
+				local sameAsHlod = (stricmp hnStr hlodStr) == 0
+				local endsWithSkl = false
+				if hnStr.count >= 4 do
+					endsWithSkl = (stricmp (substring hnStr (hnStr.count - 3) 4) "_SKL") == 0
+				if (not sameAsHlod) and endsWithSkl do
+					hlodHTreeName = hn
+			)
+		)
+
 		-- In batch mode, skip files that contain neither meshes nor animation
 		-- channels (probably empty / not-actually-w3d). Anim-only files
 		-- legitimately have meshes.count == 0 and must still load their
@@ -1541,45 +1608,157 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 			-- key off this so the user doesn't get asked again.
 			lastUsedSkeletonFile = skelfilename
 		)
+
+		-- Whenever the HLOD header names an external rig, surface it to the
+		-- user with the same message the V1.16 reference importer used. We
+		-- fire this regardless of whether the auto-derive step actually found
+		-- the skeleton on disk -- the import succeeds either way, but the
+		-- popup makes the dependency obvious (matches the user-visible
+		-- behaviour they asked for on infantry models, which always declare
+		-- an HTree even when the rig file is alongside).
+		if hlodHTreeName != undefined do
+			messageBox ("Meshes in this model require a skeleton file. \n\n Skeleton expected by model: " + (hlodHTreeName as string))
+
+		if debugOutput do
+		(
+			if hier == undefined then
+			(
+				if hlodHTreeName != undefined then
+					format " expected skeleton (HTree name): %\n" hlodHTreeName
+				else
+					format " expected skeleton (HTree name): none found\n"
+			)
+		)
 		------ debug start ------
 		--print hier
 		--print anim
 		--print meshes
-		--print hlodSet 
+		--print hlodSet
 		------ debug end ------
 		
 		-- create pivots(bones)
 		if hier != undefined then
 		(
-			--pivotName, parentID, pos, eulerAngles, rotation
-			-- to skip the ROOTTRANSFORM, i starts at 2
-			for i = 2 to hier.pivots.count do
+			-- pivotType: 1 = Max Bone (default original importer), 2 = Sphere
+			-- (V1.16-style green geom -- visually distinctive but exporter
+			-- treats it as render geometry, beware), 3 = Point Helper (tiny
+			-- helper marker; max2w3d.dle's IsW3DBoneNode picks it up via
+			-- HELPER_CLASS_ID so Select Bones / W3D export classify it as a
+			-- bone instead of geometry). Default to Bone if undefined for
+			-- back-compat with any external callers.
+			local _pt = pivotType
+			if _pt == undefined do _pt = 1
+			local pivotBoxColor = (color 0 255 0)
+
+			-- Auto-size pivot markers from the imported meshes' bbox so they
+			-- stay readable across infantry / vehicles / structures without a
+			-- per-import scale knob. Bones aren't affected -- Max sizes those
+			-- automatically from parent-to-child distance.
+			-- Done by walking raw vertex data (meshes[].verts is already
+			-- populated; mesh nodes don't exist yet).
+			local pivotBoxSize = 0.075   -- fallback for empty / no-vert files
+			local pointMarkerSize = 0.15 -- ditto
+			if meshes.count > 0 do
 			(
-				-- if hier.pivots[i].parentID < 0 do continue -- -1 means ROOTTRANSFORM
-				------ debug start ------
-				--print "-----"
-				--print i
-				--print hier.pivots[i].pivotName
-				--print hier.pivots[i].parentID
-				------ debug end ------
-				curPivot = undefined
-				--gmPivots[i-1] = bone name:hier.pivots[i].pivotName pos:hier.pivots[i].pos rotation:hier.pivots[i].rotation -- v1.03 bug
-				if hier.pivots[i].parentID == 0 then
+				local minX = 1e30; local minY = 1e30; local minZ = 1e30
+				local maxX = -1e30; local maxY = -1e30; local maxZ = -1e30
+				for mi = 1 to meshes.count do
 				(
-					curPivot = bone name:hier.pivots[i].pivotName
-					in coordsys world curPivot.rotation = hier.pivots[i].rotation
-					in coordsys world curPivot.pos = hier.pivots[i].pos
+					if meshes[mi].verts == undefined do continue
+					for v in meshes[mi].verts do
+					(
+						if v.x < minX do minX = v.x
+						if v.y < minY do minY = v.y
+						if v.z < minZ do minZ = v.z
+						if v.x > maxX do maxX = v.x
+						if v.y > maxY do maxY = v.y
+						if v.z > maxZ do maxZ = v.z
+					)
 				)
-				else
+				if maxX > minX do
 				(
-					--gmPivots[i-1] = bone name:hier.pivots[i].pivotName parent:gmPivots[hier.pivots[i].parentID] pos:hier.pivots[i].pos rotation:hier.pivots[i].rotation
-					--in coordsys parent gmPivots[i-1].rotation = hier.pivots[i].rotation
-					--in coordsys parent gmPivots[i-1].pos = hier.pivots[i].pos
-					curPivot = bone name:hier.pivots[i].pivotName parent:gmPivots[hier.pivots[i].parentID]
-					in coordsys parent curPivot.rotation = hier.pivots[i].rotation
-					in coordsys parent curPivot.pos = hier.pivots[i].pos
+					local diag = length (Point3 (maxX - minX) (maxY - minY) (maxZ - minZ))
+					-- ~1% of the bbox diagonal: 1.8u infantry -> ~0.02-0.03,
+					-- which is too small visually, so clamp to a useful floor.
+					-- Use 2% for spheres, 4% for point helpers (point markers
+					-- read smaller per-unit because they're line drawings).
+					pivotBoxSize    = amax #(diag * 0.02, 0.5)
+					pointMarkerSize = amax #(diag * 0.04, 1.0)
 				)
-				append gmPivots curPivot
+			)
+
+			-- Wrap the whole creation loop in `with redraw off` -- otherwise
+			-- each `point ... cross:true` triggers a viewport redraw per pivot
+			-- and infantry rigs (30-80 pivots) feel sluggish, especially the
+			-- helper paths whose display has more elements than a Bone.
+			with redraw off
+			(
+				--pivotName, parentID, pos, eulerAngles, rotation
+				-- to skip the ROOTTRANSFORM, i starts at 2
+				for i = 2 to hier.pivots.count do
+				(
+					curPivot = undefined
+					case _pt of
+					(
+						2: -- Sphere (V1.16 reference look)
+						(
+							if hier.pivots[i].parentID == 0 then
+							(
+								curPivot = sphere name:hier.pivots[i].pivotName \
+									radius:pivotBoxSize segs:4 wirecolor:pivotBoxColor
+								in coordsys world curPivot.rotation = hier.pivots[i].rotation
+								in coordsys world curPivot.pos = hier.pivots[i].pos
+							)
+							else
+							(
+								curPivot = sphere name:hier.pivots[i].pivotName \
+									parent:gmPivots[hier.pivots[i].parentID] \
+									radius:pivotBoxSize segs:4 wirecolor:pivotBoxColor
+								in coordsys parent curPivot.rotation = hier.pivots[i].rotation
+								in coordsys parent curPivot.pos = hier.pivots[i].pos
+							)
+							setUserProp curPivot "bone" "yes"
+						)
+						3: -- Point helper (recognised as a W3D bone by max2w3d.dle)
+						(
+							if hier.pivots[i].parentID == 0 then
+							(
+								curPivot = point name:hier.pivots[i].pivotName \
+									size:pointMarkerSize cross:true box:true \
+									axisTripod:false centermarker:false \
+									wirecolor:pivotBoxColor
+								in coordsys world curPivot.rotation = hier.pivots[i].rotation
+								in coordsys world curPivot.pos = hier.pivots[i].pos
+							)
+							else
+							(
+								curPivot = point name:hier.pivots[i].pivotName \
+									parent:gmPivots[hier.pivots[i].parentID] \
+									size:pointMarkerSize cross:true box:true \
+									axisTripod:false centermarker:false \
+									wirecolor:pivotBoxColor
+								in coordsys parent curPivot.rotation = hier.pivots[i].rotation
+								in coordsys parent curPivot.pos = hier.pivots[i].pos
+							)
+						)
+						default: -- 1: Max Bone (original behaviour)
+						(
+							if hier.pivots[i].parentID == 0 then
+							(
+								curPivot = bone name:hier.pivots[i].pivotName
+								in coordsys world curPivot.rotation = hier.pivots[i].rotation
+								in coordsys world curPivot.pos = hier.pivots[i].pos
+							)
+							else
+							(
+								curPivot = bone name:hier.pivots[i].pivotName parent:gmPivots[hier.pivots[i].parentID]
+								in coordsys parent curPivot.rotation = hier.pivots[i].rotation
+								in coordsys parent curPivot.pos = hier.pivots[i].pos
+							)
+						)
+					)
+					append gmPivots curPivot
+				)
 			)
 		)
 		
@@ -3904,20 +4083,37 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 			(
 				if gmMeshes[i] == undefined do continue
 
+				-- Skip native Skin/Physique meshes only. Those modifiers recompute vertex
+				-- normals every pipeline evaluation, so anything we wrote into the base
+				-- mesh's MeshNormalSpec is discarded immediately — Explicit base-mesh
+				-- normals can't survive past the modifier.
+				--
+				-- WWSkin used to be on this list too, but the rebuilt SkinModifierClass::
+				-- ModifyObject in max2w3d.dle now (a) sets MESH_NORMAL_MODIFIER_SUPPORT
+				-- so Max doesn't auto-clear our Explicit normals, and (b) re-skins each
+				-- Explicit base-mesh normal by Inverse(baseTM)*curTM of its vertex's
+				-- driving bone every evaluation. Explicit normals therefore follow the
+				-- rig instead of staying frozen in bind pose, so wwMakeNormalsExplicit
+				-- IS valid on WWSkin-bound meshes.
 				local isSkinned = false
+				local skinKind = ""
 				try
 				(
 					for m in gmMeshes[i].modifiers while not isSkinned do
 					(
 						local cn = (classOf m) as string
-						if cn == "Skin" or cn == "Physique" do isSkinned = true
+						if cn == "Skin" or cn == "Physique" do
+						(
+							isSkinned = true
+							skinKind = cn
+						)
 					)
 				) catch ()
 
 				if isSkinned then
 				(
 					if debugOutput do
-						format "  -> wwMakeNormalsExplicit [%]: skipped (mesh has Skin/Physique; Skin recomputes normals on evaluation, explicit base-mesh normals are discarded)\n" gmMeshes[i].name
+						format "  -> wwMakeNormalsExplicit [%]: skipped (mesh has %; recomputes vertex normals on evaluation, so explicit base-mesh normals are discarded)\n" gmMeshes[i].name skinKind
 					continue
 				)
 
@@ -3931,6 +4127,42 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 				(
 					if debugOutput do
 						format "  -> wwMakeNormalsExplicit [%]: FAILED (rebuilt max2w3d.dle required): %\n" gmMeshes[i].name (getCurrentException())
+				)
+			)
+		)
+
+		-- "Import extended w3d information": surface the W3D_MESH_HEADER3 Attributes
+		-- (Geometry Type + Hide/2-Sided/Shadow/Shatter/Tangents/Prelit/AlwaysDynLight,
+		-- Collision Physical/Projectile/Vis/Camera/Vehicle) and SortLevel into each
+		-- imported mesh's W3D Tools panel via the wwSetFlags / wwSetSorting primitives
+		-- in max2w3d.dle. Without this pass, imported meshes always read back as the
+		-- default (Normal, no flags) regardless of what the source .w3d encoded.
+		-- W3DBOX (collision box) attrs are decoded by the same wwSetFlags helper.
+		if importExtendedW3D do
+		(
+			if debugOutput do
+				format "=== Import extended W3D Info: applying mesh-header attrs ===\n"
+			for i = 1 to gmMeshes.count do
+			(
+				if gmMeshes[i] == undefined do continue
+				if meshes[i] == undefined or meshes[i].header == undefined do continue
+				local hdr = meshes[i].header
+				if debugOutput do
+				(
+					format "  [%] read: attrs=% sortLevel=% (props: %)\n" \
+						gmMeshes[i].name (bit.intAsHex hdr.attrs) hdr.sortLevel (cfDecodeW3DAttrs hdr.attrs)
+				)
+				try
+				(
+					wwSetFlags gmMeshes[i] hdr.attrs
+					wwSetSorting gmMeshes[i] hdr.sortLevel
+					if debugOutput do
+						format "  [%] applied: wwSetFlags + wwSetSorting OK\n" gmMeshes[i].name
+				)
+				catch
+				(
+					if debugOutput do
+						format "  [%] FAILED to apply (rebuilt max2w3d.dle required): %\n" gmMeshes[i].name (getCurrentException())
 				)
 			)
 		)
@@ -3993,6 +4225,26 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 			gmBox.length = pickbox.extent.y 
 			gmBox.height = pickbox.extent.z
 			gmBox.wirecolor = pickbox.boxColor
+
+			-- W3DBOX attrs (W3D_BOX_ATTRIBUTE_ALIGNED/ORIENTED + W3D_MESH_FLAG_COLLISION_TYPE_*)
+			-- get decoded by the same wwSetFlags helper used for meshes.
+			if importExtendedW3D do
+			(
+				if debugOutput do
+					format "  [%] read: box attrs=% (props: %)\n" \
+						gmBox.name (bit.intAsHex pickbox.attrs) (cfDecodeW3DAttrs pickbox.attrs)
+				try
+				(
+					wwSetFlags gmBox pickbox.attrs
+					if debugOutput do
+						format "  [%] applied: wwSetFlags OK\n" gmBox.name
+				)
+				catch
+				(
+					if debugOutput do
+						format "  [%] FAILED to apply (rebuilt max2w3d.dle required): %\n" gmBox.name (getCurrentException())
+				)
+			)
 		)
 		
 		if batch do
@@ -4010,7 +4262,7 @@ macroscript ImportW3D
 	icon:#("gMax",2)
 ( createDialog rltMain )
 
-rollout rltMain "W3D Importer" width:177 height:275
+rollout rltMain "W3D Importer" width:177 height:292
 (
 	button btnW3DImporter "Import a file" pos:[25,17] width:127 height:36
 
@@ -4024,20 +4276,28 @@ rollout rltMain "W3D Importer" width:177 height:275
 	checkbox ckbAutoBind "Auto-Bind" pos:[25,102] width:127 height:15 checked:true
 	radiobuttons rbgAutoBind "Auto-Bind type" pos:[17,127] width:162 height:30 enabled:true labels:#("max skin", "w3d skin") default:1 columns:2
 	checkbox ckbBatchProcessing "Batch processing" pos:[25,165] width:127 height:15 checked:false
+	-- Pivot representation: 1 = Max Bone (default, original importer behaviour),
+	-- 2 = Sphere (V1.16-style; renders as a small green geom but max2w3d.dle
+	-- treats it as render geometry, NOT a W3D bone -- exporter / Select Bones
+	-- won't see it), 3 = Point Helper (recommended alternative -- HELPER_CLASS_ID
+	-- so W3D Tools' Select Bones picks it up and it stays out of the geometry
+	-- export).
+	dropDownList ddlPivotType "Pivots:" pos:[25,182] width:152 height:40 items:#("Bone (default)", "Sphere", "Point Helper (slow)") selection:1 tooltip:"How to represent imported hierarchy pivots in the scene. Bone = Max bone (original). Sphere = V1.16-style green sphere (visual only -- gets exported as geometry!). Point Helper = small marker that W3D Tools recognises as a bone."
 
 	-- ADVANCED tab controls (overlap the same vertical space; visibility toggled by rbgTab)
-	checkbox ckbUseW3DMatl "Use W3D Materials" pos:[25,85] width:127 height:15 checked:false visible:false
-	checkbox ckbDebugOutput "Debug Output" pos:[25,102] width:127 height:15 checked:false visible:false
-	checkbox ckbIgnoreErrors "Strict Mode" pos:[25,119] width:127 height:15 checked:false visible:false tooltip:"Halt the import if a channel references an invalid pivot ID, instead of skipping it."
-	checkbox ckbUse3dsMax8Normals "Use 3dsMax8 Normals" pos:[25,136] width:127 height:15 checked:true visible:false tooltip:"Preserve W3D normals by marking them Explicit in MeshNormalSpec (the way Max 8 used to). Requires the rebuilt max2w3d.dle (provides the wwMakeNormalsExplicit primitive). Mutually exclusive with Fix Normals."
-	checkbox ckbFixNormals "Fix Normals" pos:[25,153] width:127 height:15 checked:false visible:false tooltip:"Destructive fallback for W3D files with broken normals: forces all faces to one smoothing group, then resets normals via Edit_Normals. Mutually exclusive with Use 3dsMax8 Normals."
-	checkbox ckbTga2Dds "tga2DDS" pos:[25,170] width:65 height:15 checked:false visible:false tooltip:"Rewrite .tga texture references to .dds (extension only; filename preserved)"
-	checkbox ckbTga2DdsRev "rev" pos:[92,170] width:60 height:15 checked:false enabled:false visible:false tooltip:"Reverse: rename .dds to .tga (only available while tga2DDS is enabled)"
-	checkbox ckbFixVertices "Fix Vertices" pos:[25,187] width:127 height:15 checked:false visible:false tooltip:"Per-element smoothing groups, then weld vertices at 0.01 threshold (preserves smoothing across the weld)"
-	checkbox ckbNoMultiMat "No Multi-Mat" pos:[25,204] width:127 height:15 checked:false visible:false tooltip:"Split meshes that would use a multi-material into separate meshes (one per texture), each with a single material assigned"
-	checkbox ckbUseWWSkin "Use 2023WWSkin" pos:[25,221] width:127 height:15 checked:false visible:false tooltip:"Bind skinned meshes using the 2023-toolchain WWSkin (Westwood Space Warp + WWSkin Binding) instead of Max's native Skin modifier. Requires the rebuilt max2w3d.dle (Phase 1+ of the WWSkin port)."
-	checkbox ckbUseExternalSkel "Use External Skeleton" pos:[25,238] width:127 height:15 checked:false visible:false tooltip:"Load the bone hierarchy from an external .w3d file (e.g. a shared skeleton) instead of the main w3d / auto-derive."
-	button btnSelectSkeleton "Select Skeleton" pos:[25,255] width:152 height:18 enabled:false visible:false
+	checkbox ckbDebugOutput "Debug Output" pos:[25,85] width:127 height:15 checked:false visible:false
+	checkbox ckbUseW3DMatl "Use W3D Materials" pos:[25,102] width:127 height:15 checked:false visible:false
+	checkbox ckbImportExtendedW3D "Import extended W3D Info" pos:[25,119] width:152 height:15 checked:false visible:false tooltip:"Restore each mesh's W3D Tools settings (Geometry Type, geometry flags like Hide / 2-Sided / Shadow / Shatter / Tangents / Prelit / AlwaysDynLight, Collision flags, Static Sort Level) from the imported .w3d's MESH_HEADER3 Attributes. Requires the rebuilt max2w3d.dle (provides wwSetFlags / wwSetSorting)."
+	checkbox ckbIgnoreErrors "Strict Mode" pos:[25,136] width:127 height:15 checked:false visible:false tooltip:"Halt the import if a channel references an invalid pivot ID, instead of skipping it."
+	checkbox ckbUse3dsMax8Normals "Use 3dsMax8 Normals" pos:[25,153] width:127 height:15 checked:true visible:false tooltip:"Preserve W3D normals by marking them Explicit in MeshNormalSpec (the way Max 8 used to). Requires the rebuilt max2w3d.dle (provides the wwMakeNormalsExplicit primitive). Mutually exclusive with Fix Normals."
+	checkbox ckbFixNormals "Fix Normals" pos:[25,170] width:127 height:15 checked:false visible:false tooltip:"Destructive fallback for W3D files with broken normals: forces all faces to one smoothing group, then resets normals via Edit_Normals. Mutually exclusive with Use 3dsMax8 Normals."
+	checkbox ckbTga2Dds "tga2DDS" pos:[25,187] width:65 height:15 checked:false visible:false tooltip:"Rewrite .tga texture references to .dds (extension only; filename preserved)"
+	checkbox ckbTga2DdsRev "rev" pos:[92,187] width:60 height:15 checked:false enabled:false visible:false tooltip:"Reverse: rename .dds to .tga (only available while tga2DDS is enabled)"
+	checkbox ckbFixVertices "Fix Vertices" pos:[25,204] width:127 height:15 checked:false visible:false tooltip:"Per-element smoothing groups, then weld vertices at 0.01 threshold (preserves smoothing across the weld)"
+	checkbox ckbNoMultiMat "No Multi-Mat" pos:[25,221] width:127 height:15 checked:false visible:false tooltip:"Split meshes that would use a multi-material into separate meshes (one per texture), each with a single material assigned"
+	checkbox ckbUseWWSkin "Use 2023WWSkin" pos:[25,238] width:127 height:15 checked:false visible:false tooltip:"Bind skinned meshes using the 2023-toolchain WWSkin (Westwood Space Warp + WWSkin Binding) instead of Max's native Skin modifier. Requires the rebuilt max2w3d.dle (Phase 1+ of the WWSkin port)."
+	checkbox ckbUseExternalSkel "Use External Skeleton" pos:[25,255] width:127 height:15 checked:false visible:false tooltip:"Load the bone hierarchy from an external .w3d file (e.g. a shared skeleton) instead of the main w3d / auto-derive."
+	button btnSelectSkeleton "Select Skeleton" pos:[25,272] width:152 height:18 enabled:false visible:false
 
 	-- Path to the user-picked external skeleton w3d. Lives at rollout scope
 	-- so it survives across multiple imports without re-prompting.
@@ -4052,11 +4312,11 @@ rollout rltMain "W3D Importer" width:177 height:275
 			(
 				w3dFiles = getFiles(fldrPath + "\\*.w3d")
 				for i=1 to w3dFiles.count do
-				( cfW3DImporter w3dFiles[i] ckbSplitDependencies.checked rbgAutoBind.state true ckbDebugOutput.checked ckbUseW3DMatl.checked (not ckbIgnoreErrors.checked) ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked ckbUseWWSkin.checked (if ckbUseExternalSkel.checked then externalSkeletonFile else undefined) ckbUse3dsMax8Normals.checked )
+				( cfW3DImporter w3dFiles[i] ckbSplitDependencies.checked rbgAutoBind.state true ckbDebugOutput.checked ckbUseW3DMatl.checked (not ckbIgnoreErrors.checked) ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked ckbUseWWSkin.checked (if ckbUseExternalSkel.checked then externalSkeletonFile else undefined) ckbUse3dsMax8Normals.checked ckbImportExtendedW3D.checked ddlPivotType.selection )
 			)
 		)
 		else
-		( cfW3DImporter undefined ckbSplitDependencies.checked rbgAutoBind.state false ckbDebugOutput.checked ckbUseW3DMatl.checked (not ckbIgnoreErrors.checked) ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked ckbUseWWSkin.checked (if ckbUseExternalSkel.checked then externalSkeletonFile else undefined) ckbUse3dsMax8Normals.checked )
+		( cfW3DImporter undefined ckbSplitDependencies.checked rbgAutoBind.state false ckbDebugOutput.checked ckbUseW3DMatl.checked (not ckbIgnoreErrors.checked) ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked ckbUseWWSkin.checked (if ckbUseExternalSkel.checked then externalSkeletonFile else undefined) ckbUse3dsMax8Normals.checked ckbImportExtendedW3D.checked ddlPivotType.selection )
 	)
 
 	-- enable rev only while tga2DDS is on; uncheck it when tga2DDS is turned off
@@ -4163,6 +4423,7 @@ rollout rltMain "W3D Importer" width:177 height:275
 		ckbAutoBind.visible          = basic
 		rbgAutoBind.visible          = basic
 		ckbBatchProcessing.visible   = basic
+		ddlPivotType.visible         = basic
 
 		ckbUseW3DMatl.visible        = not basic
 		ckbDebugOutput.visible       = not basic
@@ -4174,6 +4435,7 @@ rollout rltMain "W3D Importer" width:177 height:275
 		ckbFixVertices.visible       = not basic
 		ckbNoMultiMat.visible        = not basic
 		ckbUseWWSkin.visible         = not basic
+		ckbImportExtendedW3D.visible = not basic
 		ckbUseExternalSkel.visible   = not basic
 		btnSelectSkeleton.visible    = not basic
 	)
