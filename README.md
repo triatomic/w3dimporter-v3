@@ -6,6 +6,8 @@ Originally scripted by **coolfile**, edited and augmented by **NDC**, further ed
 
 Tested on 3ds Max 2023.
 
+![W3D Importer dialog](dialog.png)
+
 - [w3dimporter](#w3dimporter)
   - [Usage](#usage)
   - [Changelog (v17 vs v11)](#changelog-v17-vs-v11)
@@ -48,8 +50,6 @@ Tested on 3ds Max 2023.
     - [Additive textures](#additive-textures)
     - [Debug output toggle](#debug-output-toggle)
   - [License](#license)
-
-![W3D Importer dialog](dialog.png)
 
 ---
 
