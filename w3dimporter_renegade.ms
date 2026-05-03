@@ -6,6 +6,11 @@
 -- edited by tria --
 -- credits: Seagle & Sloth --
 
+-- Debug: when not set to false, the importer prints one line per mesh
+-- listing the textures it loaded. Set `w3dDebugMaterials = false` in the
+-- listener to silence.
+global w3dDebugMaterials = true
+
 -- Reload helper: a runtime error inside cfW3DImporter can leave the rollout's
 -- event-handler thread stuck, making every button in the dialog unresponsive.
 -- The dialog itself can't recover from this (its own handlers are dead), so
@@ -1186,10 +1191,15 @@ fn ReadMesh fstream chunkEnd =
 			(
 				shadeIds = ReadLongArray fstream subChunkEnd
 			)
-			--0x00000023:	--W3D_CHUNK_PRELIT_UNLIT	// optional unlit material chunk wrapper
-			--0x00000024:	--W3D_CHUNK_PRELIT_VERTEX	// optional vertex-lit material chunk wrapper
-			--0x00000025:	--W3D_CHUNK_PRELIT_LIGHTMAP_MULTI_PASS	// optional lightmapped multi-pass material chunk wrapper
-			--0x00000026:	--W3D_CHUNK_PRELIT_LIGHTMAP_MULTI_TEXTURE	// optional lightmapped multi-texture material chunk wrapper
+			-- W3D_CHUNK_PRELIT_VERTEX (0x24) is a transparent wrapper around the same
+			-- material chunks (MATERIAL_INFO/SHADERS/VERTEX_MATERIALS/TEXTURES/MATERIAL_PASS)
+			-- a non-prelit mesh has at top level. Descend by simply NOT advancing past the
+			-- wrapper -- the next loop iteration reads the inner chunks. Matches 1.16b.
+			-- Other prelit variants (UNLIT/MULTI_PASS/MULTI_TEXTURE) are skipped intentionally.
+			0x00000024: ()  -- W3D_CHUNK_PRELIT_VERTEX: descend (no-op; do not advance)
+			--0x00000023:	--W3D_CHUNK_PRELIT_UNLIT
+			--0x00000025:	--W3D_CHUNK_PRELIT_LIGHTMAP_MULTI_PASS
+			--0x00000026:	--W3D_CHUNK_PRELIT_LIGHTMAP_MULTI_TEXTURE
 			0x00000028:	--W3D_CHUNK_MATERIAL_INFO	--materials information, pass count, etc (contains W3dMaterialInfoStruct)
 			(
 				matlheader = ReadMeshMaterialSetInfo fstream subChunkEnd
@@ -1777,983 +1787,117 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 			local noMultiMatHandled = false
 			
 			-- create a new material or apply an exist one and
-			if (meshes[i].vertMatls != undefined) and (meshes[i].vertMatls.count > 0) then
+			-- Build a real W3D material (custom plugin material, class "W3D") via the
+			-- wwSet* MAXScript API exposed by max2w3d.dle. Mirrors 1.16b: the W3D
+			-- material round-trips losslessly to .w3d on export.
+			--
+			-- When a TEXTURE_STAGE has per-face TEXTURE_IDS (count > 1) the mesh uses
+			-- multiple textures within one pass; that maps to a 3ds Max Multimaterial
+			-- with one W3D submaterial per unique texture-tuple and a per-face matID.
+			if (meshes[i].vertMatls != undefined) and (meshes[i].vertMatls.count > 0) and (meshes[i].matlPasses != undefined) and (meshes[i].matlPasses.count > 0) then
 			(
-				numTextures = 0
-				if meshes[i].textures != undefined do numTextures = meshes[i].textures.count
-
-				-- Optional .tga <-> .dds extension rewrite. Many W3D files reference TGA
-				-- textures that have been re-exported as DDS later; toggling tga2dds swaps just
-				-- the extension (case-insensitive, name preserved) so the bitmaptex calls
-				-- and debug output below pick up the .dds versions automatically.
-				-- When tga2ddsRev is also on, the rewrite goes the other direction (.dds -> .tga).
-				if tga2dds and (meshes[i].textures != undefined) do
+				-- Debug: log which mesh is being built and which textures it
+				-- references. Toggle off by `w3dDebugMaterials = false` in the listener.
+				if w3dDebugMaterials != false do
 				(
-					local fromExt = if tga2ddsRev then ".dds" else ".tga"
-					local toExt   = if tga2ddsRev then ".tga" else ".dds"
-					for t = 1 to meshes[i].textures.count do
-					(
-						local fn0 = meshes[i].textures[t].txFileName
-						if fn0 != undefined and fn0.count >= 4 do
-						(
-							local ext = toLower (substring fn0 (fn0.count - 3) 4)
-							if ext == fromExt do
-								meshes[i].textures[t].txFileName = (substring fn0 1 (fn0.count - 4)) + toExt
-						)
-					)
-				)
-
-				-- W3D shader enums (from shader.h):
-				--   SrcBlend: 0=ZERO, 1=ONE, 2=SRC_ALPHA, 3=ONE_MINUS_SRC_ALPHA
-				--   DstBlend: 0=ZERO, 1=ONE, 2=SRC_COLOR, 3=ONE_MINUS_SRC_COLOR, 4=SRC_ALPHA, 5=ONE_MINUS_SRC_ALPHA
-				-- Per-shader alpha test (mirror of ShaderClass::Uses_Alpha() in shader.h)
-				fn shaderUsesAlphaW3D sh =
-				(
-					if sh.alphaTest != 0 do return true
-					if (sh.destBlend == 4) or (sh.destBlend == 5) do return true
-					if (sh.srcBlend == 2) or (sh.srcBlend == 3) do return true
-					return false
-				)
-				-- Additive preset (SC_ADDITIVE in shader.cpp): srcBlend=ONE(1), destBlend=ONE(1)
-				fn shaderIsAdditiveW3D sh =
-				(
-					return ((sh.srcBlend == 1) and (sh.destBlend == 1))
-				)
-
-				-- Mesh-level rollups (inline shader scans because MAXScript disallows nested fn refs)
-				meshAlpha = false
-				meshAlphaTest = false
-				meshAdditive = false
-				-- W3DMaterial blendmode enum: 0=Opaque,1=Add,2=Multiply,3=MultiplyAndAdd,4=Screen,
-				--                              5=AlphaBlend,6=AlphaTest,7=AlphaTestAndBlend,8=Custom
-				meshBlendMode = 0 -- defaults to Opaque if no shader signals otherwise
-				if (meshes[i].shaders != undefined) and (meshes[i].shaders.count > 0) do
-				(
-					for s = 1 to meshes[i].shaders.count do
-					(
-						sh = meshes[i].shaders[s]
-						if sh.alphaTest != 0 do meshAlphaTest = true
-						if (sh.alphaTest != 0) or (sh.destBlend == 4) or (sh.destBlend == 5) or (sh.srcBlend == 2) or (sh.srcBlend == 3) do meshAlpha = true
-						if (sh.srcBlend == 1) and (sh.destBlend == 1) do meshAdditive = true
-
-						-- Derive the W3DMaterial blendmode from this shader.
-						-- IMPORTANT: alphaTest is orthogonal to blend mode in W3D, so it must be
-						-- checked BEFORE the opaque/add/etc. blend patterns. The AlphaTest preset
-						-- has the same src/dst as Opaque (ONE/ZERO) and only differs by alphaTest.
-						local thisBm = -1
-						if (sh.srcBlend == 2) and (sh.destBlend == 5) then thisBm = (if sh.alphaTest != 0 then 7 else 5) -- AlphaTestAndBlend / AlphaBlend
-						else if sh.alphaTest != 0 then thisBm = 6   -- AlphaTest (any blend, but typically ONE/ZERO)
-						else if (sh.srcBlend == 1) and (sh.destBlend == 0) then thisBm = 0   -- Opaque
-						else if (sh.srcBlend == 1) and (sh.destBlend == 1) then thisBm = 1   -- Add
-						else if (sh.srcBlend == 0) and (sh.destBlend == 2) then thisBm = 2   -- Multiply
-						else if (sh.srcBlend == 1) and (sh.destBlend == 2) then thisBm = 3   -- MultiplyAndAdd
-						else if (sh.srcBlend == 1) and (sh.destBlend == 3) then thisBm = 4   -- Screen
-						else thisBm = 8   -- Custom (unrecognised src/dst combo)
-
-						-- Promote the mesh's blend mode toward the most expressive shader.
-						-- Order of promotion: Opaque < Custom < AlphaTest < AlphaBlend < AlphaTestAndBlend < Screen < MultiplyAndAdd < Multiply < Add
-						-- (Add wins because it's the strongest visual override; this matches the precedence used elsewhere.)
-						if thisBm == 1 then meshBlendMode = 1
-						else if (meshBlendMode != 1) and (thisBm == 7) then meshBlendMode = 7
-						else if (meshBlendMode != 1) and (meshBlendMode != 7) and (thisBm == 5) then meshBlendMode = 5
-						else if (meshBlendMode != 1) and (meshBlendMode != 7) and (meshBlendMode != 5) and (thisBm == 6) then meshBlendMode = 6
-						else if (meshBlendMode == 0) and (thisBm > 0) then meshBlendMode = thisBm
-					)
-				)
-
-				------ debug: material/texture diagnostics ------
-				if debugOutput do
-				(
-					format "=== Mesh: % ===\n" meshes[i].header.meshName
-					format "  vertMatls.count = %\n" meshes[i].vertMatls.count
-					format "  textures.count  = %\n" numTextures
+					local _texList = ""
 					if meshes[i].textures != undefined do
-					(
-						for t = 1 to meshes[i].textures.count do
-						( format "    texture[%] = %\n" t meshes[i].textures[t].txFileName )
-					)
-					-- material info header (declared pass count from W3D_CHUNK_MATERIAL_INFO)
-					if meshes[i].matlheader != undefined do
-					( format "  matlheader: passCount=% vertMatlCount=% shaderCount=% textureCount=%\n" meshes[i].matlheader.passCount meshes[i].matlheader.vertMatlCount meshes[i].matlheader.shaderCount meshes[i].matlheader.textureCount )
-					-- walk every MATERIAL_PASS chunk (one per render pass)
-					local mPasses = meshes[i].matlPasses
-					if mPasses == undefined or mPasses.count == 0 then
-					(
-						if meshes[i].matlPass != undefined then ( mPasses = #(meshes[i].matlPass) ) else ( mPasses = #() )
-					)
-					format "  matlPasses.count = %\n" mPasses.count
-					for p = 1 to mPasses.count do
-					(
-						local mpD = mPasses[p]
-						format "  -- pass[%] --\n" p
-						local dStages = mpD.textureStages
-						if (dStages == undefined) or (dStages.count == 0) do
+						for _t = 1 to meshes[i].textures.count do
+							_texList = _texList + (if _t > 1 then ", " else "") + meshes[i].textures[_t].txFileName
+					format "[w3d import] mesh % vmats=% passes=% textures=[%]\n" meshes[i].header.meshName meshes[i].vertMatls.count meshes[i].matlPasses.count _texList
+				)
+				local vmCount       = meshes[i].vertMatls.count
+				local passCount     = meshes[i].matlPasses.count
+				local shaderCount   = if meshes[i].shaders  != undefined then meshes[i].shaders.count  else 0
+				local textureCount  = if meshes[i].textures != undefined then meshes[i].textures.count else 0
+				local sortLevel     = if meshes[i].header != undefined and meshes[i].header.sortLevel != undefined then meshes[i].header.sortLevel else 0
+				local nf            = if meshes[i].faces != undefined then meshes[i].faces.count else 0
+				local surfaceType   = 0
+				if (meshes[i].faces != undefined) and (meshes[i].faces.count > 0) and (meshes[i].faces[1].attrs != undefined) do
+					surfaceType = meshes[i].faces[1].attrs
+
+				-- Detect per-face TEXTURE_IDS in any pass/stage. count > 1 => per-face.
+				local hasPerFaceTex = false
+				for pIdx = 1 to passCount while not hasPerFaceTex do
+				(
+					local mp = meshes[i].matlPasses[pIdx]
+					if mp.textureStages != undefined do
+						for sIdx = 1 to mp.textureStages.count while not hasPerFaceTex do
 						(
-							if mpD.textureStage != undefined then ( dStages = #(mpD.textureStage) ) else ( dStages = #() )
+							local ts = mp.textureStages[sIdx]
+							if ts.txIds != undefined and ts.txIds.count > 1 do hasPerFaceTex = true
 						)
-						format "    textureStages.count = %\n" dStages.count
-						for s = 1 to dStages.count do
+				)
+
+				-- Helper: populate w3dMatl's per-pass parameters. txOverride is an
+				-- array indexed [pIdx][sIdx] -> 1-based texture index, or undefined
+				-- to fall back to the first txId of each stage.
+				fn applyW3DPassParams w3dMatl mesh passCount vmCount shaderCount textureCount txOverride =
+				(
+					for pIdx = 1 to passCount do
+					(
+						local pass = pIdx - 1
+						local mp = mesh.matlPasses[pIdx]
+
+						local vmIdx = 1
+						if mp.vmIds != undefined and mp.vmIds.count > 0 do vmIdx = mp.vmIds[1] + 1
+						if vmIdx < 1 do vmIdx = 1
+						if vmIdx > vmCount do vmIdx = vmCount
+						local vm   = mesh.vertMatls[vmIdx]
+						local vinf = vm.vmInfo
+
+						wwSetMatFlags     w3dMatl pass vinf.attrs
+						if vm.vmArgs0 != undefined and vm.vmArgs0 != "" do wwSetMapperArgs w3dMatl pass 0 vm.vmArgs0
+						if vm.vmArgs1 != undefined and vm.vmArgs1 != "" do wwSetMapperArgs w3dMatl pass 1 vm.vmArgs1
+						wwSetAmbient      w3dMatl pass vinf.ambient
+						wwSetDiffuse      w3dMatl pass vinf.diffuse
+						wwSetSpecular     w3dMatl pass vinf.specular
+						wwSetEmissive     w3dMatl pass vinf.emissive
+						wwSetShininess    w3dMatl pass vinf.shininess
+						wwSetOpacity      w3dMatl pass vinf.opacity
+						wwSetTranslucency w3dMatl pass vinf.translucency
+
+						local shIdx = 1
+						if mp.shaderIds != undefined and mp.shaderIds.count > 0 do shIdx = mp.shaderIds[1] + 1
+						if shIdx < 1 do shIdx = 1
+						if shaderCount > 0 and shIdx <= shaderCount and mesh.shaders[shIdx] != undefined do
 						(
-							local dStg = dStages[s]
-							if (dStg != undefined) and (dStg.txIds != undefined) then
+							local sh = mesh.shaders[shIdx]
+							wwSetDepthCompare  w3dMatl pass sh.depthCompare
+							wwSetWriteZBuffer  w3dMatl pass (sh.depthMask != 0)
+							wwSetDestBlend     w3dMatl pass sh.destBlend
+							wwSetPriGradient   w3dMatl pass sh.priGradient
+							wwSetSecGradient   w3dMatl pass sh.secGradient
+							wwSetSrcBlend      w3dMatl pass sh.srcBlend
+							wwSetDetailColor   w3dMatl pass sh.detailColorFunc
+							wwSetDetailAlpha   w3dMatl pass sh.detailAlphaFunc
+							wwSetAlphaTestFlag w3dMatl pass (sh.alphaTest != 0)
+						)
+
+						if mp.textureStages != undefined do
+						(
+							for sIdx = 1 to mp.textureStages.count do
 							(
-								-- collect the SET of unique txIds used in this stage so we can see whether
-								-- the pass is genuinely uniform (one value) or per-face split across multiple
-								-- textures. The default `format` truncates large arrays with "..." which hides
-								-- the cases that determine which build path the importer should take.
-								local uniqVals = #()
-								for k = 1 to dStg.txIds.count do
+								local stage = sIdx - 1
+								local ts = mp.textureStages[sIdx]
+								local tIdx = -1
+								if txOverride != undefined and txOverride[pIdx] != undefined and txOverride[pIdx][sIdx] != undefined do
+									tIdx = txOverride[pIdx][sIdx]
+								if tIdx < 0 do
 								(
-									if findItem uniqVals dStg.txIds[k] == 0 do append uniqVals dStg.txIds[k]
+									tIdx = 1
+									if ts.txIds != undefined and ts.txIds.count > 0 do tIdx = ts.txIds[1] + 1
 								)
-								format "      stage[%]: txIds.count = %, unique = %, values = %\n" s dStg.txIds.count uniqVals dStg.txIds
-							)
-							else
-								format "      stage[%]: txIds = undefined\n" s
-						)
-						if mpD.vmIds != undefined then
-							format "    vmIds.count = %, values = %\n" mpD.vmIds.count mpD.vmIds
-						else
-							format "    vmIds = undefined\n"
-						if mpD.shaderIds != undefined then
-							format "    shaderIds.count = %, values = %\n" mpD.shaderIds.count mpD.shaderIds
-						else
-							format "    shaderIds = undefined\n"
-					)
-					-- alpha diagnostics
-					format "  shaders.count = %\n" (if meshes[i].shaders != undefined then meshes[i].shaders.count else 0)
-					if meshes[i].shaders != undefined do
-					(
-						for s = 1 to meshes[i].shaders.count do
-						(
-							sh = meshes[i].shaders[s]
-							-- per-shader literal label inferred from src/dst blend (alphaTest checked first)
-							local blendLabel = "Custom"
-							if (sh.srcBlend == 2) and (sh.destBlend == 5) then blendLabel = (if sh.alphaTest != 0 then "AlphaTestAndBlend" else "AlphaBlend")
-							else if sh.alphaTest != 0 then blendLabel = "AlphaTest"
-							else if (sh.srcBlend == 1) and (sh.destBlend == 0) then blendLabel = "Opaque"
-							else if (sh.srcBlend == 1) and (sh.destBlend == 1) then blendLabel = "Add"
-							else if (sh.srcBlend == 0) and (sh.destBlend == 2) then blendLabel = "Multiply"
-							else if (sh.srcBlend == 1) and (sh.destBlend == 2) then blendLabel = "MultiplyAndAdd"
-							else if (sh.srcBlend == 1) and (sh.destBlend == 3) then blendLabel = "Screen"
-							format "    shader[%]: srcBlend=%, destBlend=%, alphaTest=%, WriteZBuffer=%  -> alpha=%, additive=%, blendMode=%\n" s sh.srcBlend sh.destBlend sh.alphaTest sh.depthMask (shaderUsesAlphaW3D sh) (shaderIsAdditiveW3D sh) blendLabel
-						)
-					)
-					-- per-vertex-material info (one entry per pass): colors + stage0/stage1 mapping types + mapper args.
-					-- W3D vmInfo.attrs encodes mapping types: bits 16-23 = stage0Mapping, bits 8-15 = stage1Mapping.
-					-- vmArgs0/vmArgs1 are the per-stage mapper args strings (match stage0mappingargs/stage1mappingargs).
-					if meshes[i].vertMatls != undefined do
-					(
-						for v = 1 to meshes[i].vertMatls.count do
-						(
-							local vmEntry = meshes[i].vertMatls[v]
-							format "    vertMatl[%]: name=%\n" v vmEntry.vmName
-							if vmEntry.vmInfo != undefined do
-							(
-								format "      ambient   = %\n" vmEntry.vmInfo.ambient
-								format "      diffuse   = %\n" vmEntry.vmInfo.diffuse
-								format "      specular  = %\n" vmEntry.vmInfo.specular
-								format "      emissive  = %\n" vmEntry.vmInfo.emissive
-								format "      opacity      = %\n" vmEntry.vmInfo.opacity
-								format "      translucency = %\n" vmEntry.vmInfo.translucency
-								format "      shininess    = %\n" vmEntry.vmInfo.shininess
-								local attrsVal = vmEntry.vmInfo.attrs
-								local stage0Map = bit.and (bit.shift attrsVal -16) 0xFF
-								local stage1Map = bit.and (bit.shift attrsVal -8) 0xFF
-								-- W3DMaterialMappingType enum (from w3dmaterial.h)
-								local mapNames = #("UV","Environment","ClassicEnvironment","Screen","LinearOffset","Silhouette","Scale","Grid","Rotate","Sine","Step","ZigZag","WSClassicEnv","WSEnvironment","GridClassicEnv","GridEnvironment","Random","Edge","BumpEnv","GridWSClassicEnv","GridWSEnv")
-								local s0Label = if (stage0Map + 1) >= 1 and (stage0Map + 1) <= mapNames.count then mapNames[stage0Map + 1] else "Unknown"
-								local s1Label = if (stage1Map + 1) >= 1 and (stage1Map + 1) <= mapNames.count then mapNames[stage1Map + 1] else "Unknown"
-								format "      attrs=0x% stage0mapping=% (%) stage1mapping=% (%)\n" (bit.intAsHex attrsVal) stage0Map s0Label stage1Map s1Label
-								-- W3D doesn't store stage0mappinguvchannel or speculartodiffuse; defaults on import.
-								format "      stage0mappinguvchannel = 1 (default; W3D file has no value)\n"
-								format "      stage1mappinguvchannel = 1 (default; W3D file has no value)\n"
-								format "      speculartodiffuse = off (default; W3D file has no value)\n"
-							)
-							if vmEntry.vmArgs0 != undefined and vmEntry.vmArgs0 != "" do
-								format "      stage0mappingargs = \"%\"\n" vmEntry.vmArgs0
-							if vmEntry.vmArgs1 != undefined and vmEntry.vmArgs1 != "" do
-								format "      stage1mappingargs = \"%\"\n" vmEntry.vmArgs1
-						)
-					)
-					format "  meshUsesAlpha = %\n" meshAlpha
-					format "  meshIsAlphaTest = %\n" meshAlphaTest
-					format "  meshIsAdditive = %\n" meshAdditive
-					-- final W3DMaterial blendmode that buildW3DMatl will set
-					local pickedLabel = "Opaque"
-					case meshBlendMode of
-					(
-						0: pickedLabel = "Opaque"
-						1: pickedLabel = "Add"
-						2: pickedLabel = "Multiply"
-						3: pickedLabel = "MultiplyAndAdd"
-						4: pickedLabel = "Screen"
-						5: pickedLabel = "AlphaBlend"
-						6: pickedLabel = "AlphaTest"
-						7: pickedLabel = "AlphaTestAndBlend"
-						8: pickedLabel = "Custom"
-					)
-					format "  W3DMaterial blendmode -> % (%)\n" meshBlendMode pickedLabel
-				)
-				------ end debug ------
-
-				-- Build a W3DMaterial (from the installed W3D Tools plugin) configured from a vertex material + texture.
-				-- Returns undefined if the W3DMaterial class is not available.
-				-- blendMode enum: 0=Opaque, 1=Add, 2=Multiply, 3=MultiplyAndAdd, 4=Screen,
-				--                 5=AlphaBlend, 6=AlphaTest, 7=AlphaTestAndBlend, 8=Custom
-				-- Pick the blend mode for sub-material `subIx` (0-based texture index in W3D, 1-based here).
-				-- Looks for a face whose txIds entry matches subIx-1, then reads that face's shader from shaderIds.
-				-- Falls back to meshBlendMode if no per-face data is present.
-				-- (shader->blendMode logic is inlined because MAXScript disallows nested fn cross-refs.)
-				fn pickBlendModeForSub mesh subIx fallback =
-				(
-					if mesh.matlPass == undefined do return fallback
-					if mesh.shaders == undefined or mesh.shaders.count == 0 do return fallback
-
-					local txIds = undefined
-					if mesh.matlPass.textureStage != undefined do txIds = mesh.matlPass.textureStage.txIds
-					local shIds = mesh.matlPass.shaderIds
-
-					if shIds == undefined or shIds.count == 0 do return fallback
-
-					-- Short-form matlPass: shaderIds has 1 entry. If the mesh actually has multiple
-					-- shaders (one per pass), map sub index -> shaders[subIx] directly; otherwise
-					-- every sub uses the single referenced shader.
-					if shIds.count == 1 do
-					(
-						local sxSel = -1
-						if mesh.shaders.count > 1 and subIx >= 1 and subIx <= mesh.shaders.count then
-							sxSel = subIx
-						else if subIx > mesh.shaders.count then
-						(
-							-- unmapped sub beyond shader count (orphan texture not face-referenced).
-							-- Use SAGE naming convention: textures ending in "_G" are glow/Add, else Opaque base.
-							local tName = ""
-							try ( tName = mesh.textures[subIx].txFileName ) catch ()
-							if tName != undefined and tName != "" do
-							(
-								local lcName = toLower tName
-								-- strip extension
-								local dotIx = findString lcName "."
-								local baseName = lcName
-								if dotIx != undefined and dotIx > 1 do baseName = substring lcName 1 (dotIx - 1)
-								if baseName.count >= 2 and (substring baseName (baseName.count - 1) 2) == "_g" do return 1
-							)
-							sxSel = 1  -- default to first/base shader (typically Opaque)
-						)
-						else
-							sxSel = shIds[1] + 1
-						if sxSel < 1 or sxSel > mesh.shaders.count do return fallback
-						local sh = mesh.shaders[sxSel]
-						-- alphaTest must be checked before opaque/add patterns (see comment in rollup).
-						if (sh.srcBlend == 2) and (sh.destBlend == 5) do return (if sh.alphaTest != 0 then 7 else 5)
-						if sh.alphaTest != 0 do return 6
-						if (sh.srcBlend == 1) and (sh.destBlend == 0) do return 0
-						if (sh.srcBlend == 1) and (sh.destBlend == 1) do return 1
-						if (sh.srcBlend == 0) and (sh.destBlend == 2) do return 2
-						if (sh.srcBlend == 1) and (sh.destBlend == 2) do return 3
-						if (sh.srcBlend == 1) and (sh.destBlend == 3) do return 4
-						return 8
-					)
-
-					-- No per-face txIds: assume sub i uses shader i (best-effort).
-					if txIds == undefined or txIds.count <= 1 do
-					(
-						if subIx < 1 or subIx > shIds.count do return fallback
-						local sx2 = shIds[subIx] + 1
-						if sx2 < 1 or sx2 > mesh.shaders.count do return fallback
-						local sh2 = mesh.shaders[sx2]
-						if (sh2.srcBlend == 2) and (sh2.destBlend == 5) do return (if sh2.alphaTest != 0 then 7 else 5)
-						if sh2.alphaTest != 0 do return 6
-						if (sh2.srcBlend == 1) and (sh2.destBlend == 0) do return 0
-						if (sh2.srcBlend == 1) and (sh2.destBlend == 1) do return 1
-						if (sh2.srcBlend == 0) and (sh2.destBlend == 2) do return 2
-						if (sh2.srcBlend == 1) and (sh2.destBlend == 2) do return 3
-						if (sh2.srcBlend == 1) and (sh2.destBlend == 3) do return 4
-						return 8
-					)
-
-					-- Per-face txIds + per-face shaderIds: walk faces, collect blend modes used by any face whose
-					-- texture matches this sub, and promote toward the strongest expressive shader (Add wins).
-					local picked = -1
-					local target = subIx - 1
-					local n = txIds.count
-					if shIds.count < n do n = shIds.count
-					for f = 1 to n do
-					(
-						if txIds[f] != target do continue
-						local sx3 = shIds[f] + 1
-						if sx3 < 1 or sx3 > mesh.shaders.count do continue
-						local sh3 = mesh.shaders[sx3]
-						local bm = 8
-						if (sh3.srcBlend == 2) and (sh3.destBlend == 5) then bm = (if sh3.alphaTest != 0 then 7 else 5)
-						else if sh3.alphaTest != 0 then bm = 6
-						else if (sh3.srcBlend == 1) and (sh3.destBlend == 0) then bm = 0
-						else if (sh3.srcBlend == 1) and (sh3.destBlend == 1) then bm = 1
-						else if (sh3.srcBlend == 0) and (sh3.destBlend == 2) then bm = 2
-						else if (sh3.srcBlend == 1) and (sh3.destBlend == 2) then bm = 3
-						else if (sh3.srcBlend == 1) and (sh3.destBlend == 3) then bm = 4
-
-						if picked == -1 then picked = bm
-						else if bm == 1 then picked = 1
-						else if (picked != 1) and (bm == 7) then picked = 7
-						else if (picked != 1) and (picked != 7) and (bm == 5) then picked = 5
-						else if (picked != 1) and (picked != 7) and (picked != 5) and (bm == 6) then picked = 6
-						else if (picked == 0) and (bm > 0) then picked = bm
-					)
-					if picked == -1 do return fallback
-					return picked
-				)
-
-				-- Build a single multi-pass W3DMaterial using the plugin's native pass blocks
-				-- (passcountblock + passone/passtwo/passthree/passfour). Each pass holds its own
-				-- vertex material, shader-derived blendmode, stage 0 texture and (optional) stage 1
-				-- texture. Returns the W3DMaterial on success, undefined if the plugin doesn't expose
-				-- the per-pass blocks (e.g. older builds where only PassOne is writable from MAXScript).
-				--
-				-- The per-pass property writes are inlined (not factored into a helper fn) because
-				-- MAXScript disallows local fn cross-references inside the importer's outer fn.
-				fn buildMultiPassW3DMatl matName vmList texList tex1List bmList =
-				(
-					-- Builds a single W3DMaterial with native multi-pass support.
-					-- Requires a max2w3d.dle build where pass 2/3/4 ParamBlock2 declarations have
-					-- suffixed param internal-names (_p2/_p3/_p4); pass 1 keeps bare names. See
-					-- src/w3dmaxtools/Source/w3dmaterial.cpp -> W3DMAT_PASS_PARAMS macro.
-					local nPasses = vmList.count
-					if nPasses < 1 or nPasses > 4 do return undefined
-					local m = undefined
-					try ( m = W3DMaterial name:matName ) catch ( m = undefined )
-					if m == undefined do return undefined
-					-- Set pass count first (lives on PassCountBlock, exposed as #passcount)
-					try ( setProperty m #passcount nPasses ) catch ()
-					local suffixes = #("", "_p2", "_p3", "_p4")
-					fn setP m baseName suffix value =
-					(
-						local nm = (baseName + suffix) as Name
-						try ( setProperty m nm value ) catch ()
-					)
-					-- Pick the best pass for viewport display.
-					-- Priority 1: stage0 mapping == UV (0). Priority 2 (tiebreaker): opaque blend mode (0).
-					-- A pass without a stage0 texture is skipped; stage1-only passes are never chosen.
-					local displayPassIdx = 0
-					local displayPassIsUV = false
-					local displayPassIsOpaque = false
-					for p = 1 to nPasses do
-					(
-						if texList[p] != undefined and texList[p] != "" do
-						(
-							local vm = vmList[p]
-							local stage0Map = 0
-							if vm.vmInfo != undefined do
-								stage0Map = bit.and (bit.shift vm.vmInfo.attrs -16) 0xFF
-							local isUV = (stage0Map == 0)
-							local isOpaque = (bmList[p] == 0)
-							local isBetter = (displayPassIdx == 0)
-							if not isBetter do
-							(
-								if isUV and not displayPassIsUV then
-									isBetter = true
-								else if isUV and displayPassIsUV and isOpaque and not displayPassIsOpaque then
-									isBetter = true
-							)
-							if isBetter do
-							(
-								displayPassIdx = p
-								displayPassIsUV = isUV
-								displayPassIsOpaque = isOpaque
-							)
-						)
-					)
-					for p = 1 to nPasses do
-					(
-						local sfx = suffixes[p]
-						local vm = vmList[p]
-						local tex0 = texList[p]
-						local tex1 = tex1List[p]
-						local blendMode = bmList[p]
-						-- vertex material colors / opacity / shininess
-						setP m "ambientcolour" sfx vm.vmInfo.ambient
-						setP m "diffusecolour" sfx vm.vmInfo.diffuse
-						setP m "specularcolour" sfx vm.vmInfo.specular
-						setP m "emissivecolour" sfx vm.vmInfo.emissive
-						setP m "opacity" sfx vm.vmInfo.opacity
-						setP m "shininess" sfx vm.vmInfo.shininess
-						setP m "translucency" sfx vm.vmInfo.translucency
-						if vm.vmInfo != undefined do
-						(
-							local attrsVal = vm.vmInfo.attrs
-							local stage0Map = bit.and (bit.shift attrsVal -16) 0xFF
-							local stage1Map = bit.and (bit.shift attrsVal -8) 0xFF
-							setP m "stage0mapping" sfx stage0Map
-							setP m "stage1mapping" sfx stage1Map
-						)
-						if vm.vmArgs0 != undefined and vm.vmArgs0 != "" do
-							setP m "stage0mappingargs" sfx vm.vmArgs0
-						if vm.vmArgs1 != undefined and vm.vmArgs1 != "" do
-							setP m "stage1mappingargs" sfx vm.vmArgs1
-						setP m "stage0mappinguvchannel" sfx 1
-						setP m "stage1mappinguvchannel" sfx 1
-						setP m "speculartodiffuse" sfx false
-						setP m "blendmode" sfx blendMode
-						setP m "alphatest" sfx (blendMode == 6 or blendMode == 7)
-						if blendMode == 1 do
-						(
-							setP m "customblendwritezbuffer" sfx false
-							setP m "alphatest" sfx false
-							setP m "blendmodesrc" sfx 1
-							setP m "blendmodedest" sfx 1
-						)
-						if (blendMode == 5) or (blendMode == 7) do
-						(
-							setP m "customblendwritezbuffer" sfx false
-							setP m "blendmodesrc" sfx 2
-							setP m "blendmodedest" sfx 5
-						)
-						if tex0 != undefined and tex0 != "" do
-						(
-							setP m "stage0texenabled" sfx true
-							setP m "stage0texturemap" sfx (bitmaptex filename:tex0)
-							if p == displayPassIdx do
-								setP m "stage0display" sfx true
-						)
-						if tex1 != undefined and tex1 != "" do
-						(
-							setP m "stage1texenabled" sfx true
-							setP m "stage1texturemap" sfx (bitmaptex filename:tex1)
-						)
-					)
-					format "    [buildMultiPassW3DMatl] OK matName=% nPasses=%\n" matName nPasses
-					return m
-				)
-
-				fn buildW3DMatl matName vm texFile blendMode =
-				(
-					local m = undefined
-					try ( m = W3DMaterial name:matName ) catch ( m = undefined )
-					if m == undefined do return undefined
-
-					-- vertex material colors / opacity / shininess
-					try ( setProperty m #ambientcolour vm.vmInfo.ambient ) catch ()
-					try ( setProperty m #diffusecolour vm.vmInfo.diffuse ) catch ()
-					try ( setProperty m #specularcolour vm.vmInfo.specular ) catch ()
-					try ( setProperty m #emissivecolour vm.vmInfo.emissive ) catch ()
-					try ( setProperty m #opacity vm.vmInfo.opacity ) catch ()
-					try ( setProperty m #shininess vm.vmInfo.shininess ) catch ()
-					try ( setProperty m #translucency vm.vmInfo.translucency ) catch ()
-
-					-- stage0/stage1 mapping types come from W3D vmInfo.attrs bitfield:
-					-- bits 16-23 = stage0Mapping, bits 8-15 = stage1Mapping. The mapper-args
-					-- strings live in vmArgs0/vmArgs1.
-					if vm.vmInfo != undefined do
-					(
-						local attrsVal = vm.vmInfo.attrs
-						local stage0Map = bit.and (bit.shift attrsVal -16) 0xFF
-						local stage1Map = bit.and (bit.shift attrsVal -8) 0xFF
-						try ( setProperty m #stage0mapping stage0Map ) catch ()
-						try ( setProperty m #stage1mapping stage1Map ) catch ()
-					)
-					if vm.vmArgs0 != undefined and vm.vmArgs0 != "" do
-					( try ( setProperty m #stage0mappingargs vm.vmArgs0 ) catch () )
-					if vm.vmArgs1 != undefined and vm.vmArgs1 != "" do
-					( try ( setProperty m #stage1mappingargs vm.vmArgs1 ) catch () )
-
-					-- W3D doesn't carry these; apply sensible defaults.
-					try ( setProperty m #stage0mappinguvchannel 1 ) catch ()
-					try ( setProperty m #stage1mappinguvchannel 1 ) catch ()
-					try ( setProperty m #speculartodiffuse false ) catch ()
-
-					-- blend mode comes straight from the W3D shader classification
-					try ( setProperty m #blendmode blendMode ) catch ()
-					try ( setProperty m #alphatest (blendMode == 6 or blendMode == 7) ) catch ()
-
-					-- additive (Add): don't write to z-buffer, force alphatest off, set src/dst = One/One
-					if blendMode == 1 do
-					(
-						try ( setProperty m #customblendwritezbuffer false ) catch ()
-						try ( setProperty m #alphatest false ) catch ()
-						try ( setProperty m #blendmodesrc 1 ) catch ()  -- One
-						try ( setProperty m #blendmodedest 1 ) catch () -- One
-					)
-					-- alpha blend (5) and alpha-test+blend (7): set src/dst = SrcAlpha / OneMinusSrcAlpha
-					-- The plugin's blendmode dropdown sometimes doesn't auto-fill these; write them explicitly.
-					if (blendMode == 5) or (blendMode == 7) do
-					(
-						try ( setProperty m #customblendwritezbuffer false ) catch ()
-						try ( setProperty m #blendmodesrc 2 ) catch ()  -- SrcAlpha
-						try ( setProperty m #blendmodedest 5 ) catch () -- OneMinusSrcAlpha
-					)
-
-					-- stage 0 texture
-					if texFile != undefined and texFile != "" do
-					(
-						try ( setProperty m #stage0texenabled true ) catch ()
-						try ( setProperty m #stage0texturemap (bitmaptex filename:texFile) ) catch ()
-						try ( setProperty m #stage0display true ) catch () -- show in viewport
-					)
-					return m
-				)
-
-				-- Detect "single material, two texture stages" pattern:
-				-- W3D encodes this as 1 vertMatl + 1 shader + 2 textures, with the vertMatl's
-				-- attrs bitfield (or vmArgs1) signalling a stage-1 mapping. In that case the
-				-- engine renders it as one material with stage0 = textures[1] and stage1 =
-				-- textures[2] (e.g. SHIELDS: noise + gradient via LinearOffset on both stages).
-				-- Without this detection the importer would split it into a multi-material,
-				-- which is wrong because the engine never renders these as separate sub-materials.
-				local twoStageHandled = false
-				if useW3DMatl and (numTextures == 2) and (meshes[i].vertMatls.count == 1) and (meshes[i].shaders != undefined) and (meshes[i].shaders.count == 1) do
-				(
-					local tsVm = meshes[i].vertMatls[1]
-					local tsStage1Map = 0
-					if tsVm.vmInfo != undefined do
-						tsStage1Map = bit.and (bit.shift tsVm.vmInfo.attrs -8) 0xFF
-					local tsHasStage1Args = (tsVm.vmArgs1 != undefined) and (tsVm.vmArgs1 != "")
-					if (tsStage1Map != 0) or tsHasStage1Args do
-					(
-						-- buildW3DMatl writes stage 0 (texture[1]) and both stages' mapping
-						-- types/args from the vertex material; we just append stage 1's texture.
-						local tex0 = meshes[i].textures[1].txFileName
-						local tex1 = meshes[i].textures[2].txFileName
-						local tsMatl = buildW3DMatl meshes[i].header.meshName tsVm tex0 meshBlendMode
-						if tsMatl != undefined do
-						(
-							try ( setProperty tsMatl #stage1texenabled true ) catch ()
-							try ( setProperty tsMatl #stage1texturemap (bitmaptex filename:tex1) ) catch ()
-							gmMeshes[i].material = tsMatl
-							twoStageHandled = true
-							if debugOutput do
-							(
-								format "  -> single W3DMaterial, two stages: stage0=% stage1=%\n" tex0 tex1
-							)
-						)
-					)
-				)
-
-				-- Detect "single sub-material, multi-pass" pattern (e.g. base + glow) using matlPasses:
-				-- W3D stores one MATERIAL_PASS chunk per render pass. When each pass has uniform
-				-- single-valued vmIds/txIds/shaderIds (every face uses the same triple in that pass),
-				-- the file is describing a single sub-material with N render passes -- not a multi-sub.
-				-- Build an N-sub MultiMaterial (one W3DMaterial per pass) so that on re-export the W3D
-				-- exporter writes all passes back out. Pass 2+ properties aren't writable on a single
-				-- W3DMaterial from MAXScript, so multi-sub is the round-trip workaround.
-				if (not twoStageHandled) and (meshes[i].matlPasses != undefined) and (meshes[i].matlPasses.count >= 2) and (meshes[i].shaders != undefined) and (meshes[i].vertMatls != undefined) do
-				(
-					local mPs = meshes[i].matlPasses
-					local nPasses = mPs.count
-					-- per-pass arrays of (vmIx, shIx) -- 1-based for max
-					-- per-pass texture indices: passTxIxStages[p] is an array (one tx index per stage)
-					local passVmIx = #()
-					local passTxIxStages = #()
-					local passShIx = #()
-					local passUniform = true
-					for p = 1 to nPasses while passUniform do
-					(
-						local pp = mPs[p]
-						if pp == undefined do ( passUniform = false; exit )
-						local vIds = pp.vmIds
-						local sIds = pp.shaderIds
-						-- assemble the per-pass list of texture stages (prefer multi-stage array,
-						-- fall back to legacy single-stage field for older-shaped data)
-						local stages = pp.textureStages
-						if (stages == undefined) or (stages.count == 0) do
-						(
-							if pp.textureStage != undefined then ( stages = #(pp.textureStage) ) else ( stages = #() )
-						)
-						-- check vmIds / shaderIds uniformity (single-element short form is fine)
-						if vIds != undefined and vIds.count > 1 do
-						( for k = 2 to vIds.count while passUniform do ( if vIds[k] != vIds[1] do passUniform = false ) )
-						if passUniform and sIds != undefined and sIds.count > 1 do
-						( for k = 2 to sIds.count while passUniform do ( if sIds[k] != sIds[1] do passUniform = false ) )
-						-- check per-stage txIds uniformity, collect one tx index per stage
-						local stageTxList = #()
-						if passUniform do
-						(
-							for s = 1 to stages.count while passUniform do
-							(
-								local stg = stages[s]
-								local tIds = undefined
-								if stg != undefined do tIds = stg.txIds
-								if tIds != undefined and tIds.count > 1 do
-								( for k = 2 to tIds.count while passUniform do ( if tIds[k] != tIds[1] do passUniform = false ) )
-								if passUniform do
+								if tIdx >= 1 and tIdx <= textureCount and mesh.textures[tIdx] != undefined do
 								(
-									local txZero = if tIds != undefined and tIds.count > 0 then tIds[1] else 0
-									append stageTxList (txZero + 1)
-								)
-							)
-						)
-						if passUniform do
-						(
-							local vmZero = if vIds != undefined and vIds.count > 0 then vIds[1] else 0
-							local shZero = if sIds != undefined and sIds.count > 0 then sIds[1] else 0
-							append passVmIx (vmZero + 1)
-							append passShIx (shZero + 1)
-							append passTxIxStages stageTxList
-						)
-					)
-					if passUniform and passTxIxStages.count == nPasses do
-					(
-						-- classify shader -> blendMode
-						fn _tpClassify sh =
-						(
-							if sh == undefined do return 0
-							if (sh.srcBlend == 2) and (sh.destBlend == 5) do return (if sh.alphaTest != 0 then 7 else 5)
-							if sh.alphaTest != 0 do return 6
-							if (sh.srcBlend == 1) and (sh.destBlend == 0) do return 0
-							if (sh.srcBlend == 1) and (sh.destBlend == 1) do return 1
-							if (sh.srcBlend == 0) and (sh.destBlend == 2) do return 2
-							if (sh.srcBlend == 1) and (sh.destBlend == 2) do return 3
-							if (sh.srcBlend == 1) and (sh.destBlend == 3) do return 4
-							return 8
-						)
-
-						-- Resolve per-pass (vm, tex0, tex1, blendMode) up-front. Used by both the
-						-- single-W3DMaterial-with-N-passes path (preferred) and the legacy
-						-- multi-sub fallback path.
-						local mpVms = #()
-						local mpTex0 = #()
-						local mpTex1 = #()
-						local mpBms = #()
-						local mpResolved = true
-						for p = 1 to nPasses while mpResolved do
-						(
-							local vmIx = passVmIx[p]
-							local stageTxIxs = passTxIxStages[p]
-							local shIx = passShIx[p]
-							if vmIx < 1 or vmIx > meshes[i].vertMatls.count do ( mpResolved = false; exit )
-							if shIx < 1 or shIx > meshes[i].shaders.count do ( mpResolved = false; exit )
-							if (stageTxIxs == undefined) or (stageTxIxs.count == 0) do ( mpResolved = false; exit )
-							local stagesOk = true
-							for s = 1 to stageTxIxs.count while stagesOk do
-							( if (stageTxIxs[s] < 1) or (stageTxIxs[s] > meshes[i].textures.count) do stagesOk = false )
-							if not stagesOk do ( mpResolved = false; exit )
-							append mpVms meshes[i].vertMatls[vmIx]
-							append mpTex0 meshes[i].textures[stageTxIxs[1]].txFileName
-							if stageTxIxs.count >= 2 then ( append mpTex1 meshes[i].textures[stageTxIxs[2]].txFileName ) else ( append mpTex1 "" )
-							append mpBms (_tpClassify meshes[i].shaders[shIx])
-						)
-
-						-- Preferred path: build a SINGLE W3DMaterial with N native passes via the
-						-- plugin's passcountblock + passone/passtwo/... param blocks. This matches
-						-- how the W3D Tools plugin actually represents multi-pass materials and
-						-- round-trips correctly through the W3D exporter.
-						local singleMatlBuilt = false
-						if useW3DMatl and mpResolved do
-						(
-							local mpW3D = buildMultiPassW3DMatl meshes[i].header.meshName mpVms mpTex0 mpTex1 mpBms
-							if mpW3D != undefined do
-							(
-								gmMeshes[i].material = mpW3D
-								twoStageHandled = true
-								singleMatlBuilt = true
-								-- single material -> all faces use matID 1
-								for f = 1 to meshes[i].faces.count do
-								( setFaceMatID gmMeshes[i] f 1 )
-								update gmMeshes[i]
-								if debugOutput do
-								(
-									format "  -> single W3DMaterial with % native passes:\n" nPasses
-									for p = 1 to nPasses do
+									local tex = mesh.textures[tIdx]
+									wwSetTexture w3dMatl tex.txFileName ((pass * 2) + stage)
+									if tex.txInfo != undefined do
 									(
-										if mpTex1[p] != "" then
-											format "       pass[%]: stage0=% stage1=% blendmode=%\n" p mpTex0[p] mpTex1[p] mpBms[p]
-										else
-											format "       pass[%]: stage0=% blendmode=%\n" p mpTex0[p] mpBms[p]
-									)
-								)
-							)
-						)
-
-						-- Fallback (legacy): build one sub-material per pass and assemble a MultiMaterial.
-						-- Used when the W3DMaterial plugin doesn't expose multi-pass blocks (older builds)
-						-- or when useW3DMatl is false (standardMaterial fallback path).
-						local subs = #()
-						local subNames = #()
-						local bms = #()
-						local texFiles = #()		-- stage 0 file per pass (used for diagnostics + std-mat fallback)
-						local tex1Files = #()		-- stage 1 file per pass (or "" if absent)
-						local allBuilt = (not singleMatlBuilt) and mpResolved
-						for p = 1 to nPasses while allBuilt do
-						(
-							local vmIx = passVmIx[p]
-							local stageTxIxs = passTxIxStages[p]
-							local shIx = passShIx[p]
-							local pVm = meshes[i].vertMatls[vmIx]
-							local pTex = meshes[i].textures[stageTxIxs[1]].txFileName	-- stage 0
-							local pTex1 = ""
-							if stageTxIxs.count >= 2 do pTex1 = meshes[i].textures[stageTxIxs[2]].txFileName
-							local pBm = _tpClassify meshes[i].shaders[shIx]
-							local pName = pVm.vmName + "_pass" + (p as string)
-							local pSub = undefined
-							if useW3DMatl then
-							(
-								pSub = buildW3DMatl pName pVm pTex pBm
-								-- wire stage 1 texture if this pass uses two texture stages
-								if (pSub != undefined) and (pTex1 != "") do
-								(
-									try ( setProperty pSub #stage1texenabled true ) catch ()
-									try ( setProperty pSub #stage1texturemap (bitmaptex filename:pTex1) ) catch ()
-								)
-							)
-							else
-							(
-								-- standard material per pass: alpha/additive wired from this pass's blendmode
-								local pAlpha = (pBm == 5) or (pBm == 7)
-								local pAdditive = (pBm == 1)
-								pSub = standardMaterial name:pName
-								pSub.ambient = pVm.vmInfo.ambient
-								pSub.diffuse = pVm.vmInfo.diffuse
-								pSub.specular = pVm.vmInfo.specular
-								pSub.glossiness = pVm.vmInfo.shininess * 100
-								pSub.opacity = pVm.vmInfo.opacity * 100
-								local pDiffTex = bitmaptex filename:pTex
-								try ( pDiffTex.alphaSource = 2 ) catch ()
-								pSub.diffuseMap = pDiffTex
-								showTextureMap pSub pSub.diffuseMap true
-								if pAlpha do
-								(
-									local pOpTex = bitmaptex filename:pTex
-									pOpTex.monoOutput = 1
-									pSub.opacityMap = pOpTex
-									showTextureMap pSub pSub.opacityMap true
-								)
-								if pAdditive do
-								(
-									local pAddOp = bitmaptex filename:pTex
-									pSub.opacityMap = pAddOp
-									showTextureMap pSub pSub.opacityMap true
-									local pAddSi = bitmaptex filename:pTex
-									pSub.selfIllumMap = pAddSi
-									showTextureMap pSub pSub.selfIllumMap true
-									try ( pSub.useSelfIllumColor = true ) catch ()
-								)
-							)
-							if pSub == undefined do ( allBuilt = false; exit )
-							append subs pSub
-							append subNames pName
-							append bms pBm
-							append texFiles pTex
-							append tex1Files pTex1
-						)
-						if allBuilt and subs.count == nPasses do
-						(
-							local mpMulti = multiMaterial numsubs:nPasses name:meshes[i].header.meshName
-							for p = 1 to nPasses do
-							(
-								mpMulti.materialList[p] = subs[p]
-								mpMulti.names[p] = subNames[p]
-							)
-							gmMeshes[i].material = mpMulti
-							twoStageHandled = true
-
-							-- Viewport heuristic: 3ds Max multi-sub renders only one sub per face.
-							-- The W3D pass order is preserved in the material list (so re-export round-trips),
-							-- but for visual fidelity we point face matIDs at the "main" pass:
-							--   * If any pass is AlphaBlend (5) or AlphaTestAndBlend (7), prefer that
-							--     pass -- it's typically the authored building/object texture composited
-							--     onto an Opaque base/tint pass (e.g. WELL: lakedusk Opaque + cbmogwell01 AlphaBlend).
-							--   * Otherwise default to sub 1 (pass 1, the base).
-							local viewportSub = 1
-							for p = 1 to nPasses do
-							(
-								if (bms[p] == 5) or (bms[p] == 7) do ( viewportSub = p; exit )
-							)
-							if viewportSub != 1 do
-							(
-								for f = 1 to meshes[i].faces.count do
-								( setFaceMatID gmMeshes[i] f viewportSub )
-								update gmMeshes[i]
-							)
-
-							if debugOutput do
-							(
-								format "  -> %-pass MultiMaterial (viewport sub=%):\n" nPasses viewportSub
-								for p = 1 to nPasses do
-								(
-									if tex1Files[p] != "" then
-										format "       sub[%]: stage0=% stage1=% blendmode=% vm=% sh=%\n" p texFiles[p] tex1Files[p] bms[p] passVmIx[p] passShIx[p]
-									else
-										format "       sub[%]: tex=% blendmode=% vm=% sh=%\n" p texFiles[p] bms[p] passVmIx[p] passShIx[p]
-								)
-							)
-						)
-					)
-				)
-
-				-- Detect "multi-sub × multi-pass" pattern (e.g. CHASSIS in the AVOM file):
-				-- Each pass has UNIFORM vm/shader (single bucket of vertex-material + shader per pass)
-				-- but PER-FACE-varying txIds. Faces split into N material buckets where each bucket
-				-- uses a different texture per pass. Result: one W3DMaterial per bucket, with
-				-- passcount=nPasses, pass p's stage 0 = textures[bucket.tex[p]+1].
-				--
-				-- W3D file shape this targets:
-				--   passCount=2, vmCount=2, shCount=2, textureCount=N (N>2)
-				--   pass[1].txIds = per-face values from bucket-A's pass-1 texture index, bucket-B's pass-1 idx, ...
-				--   pass[2].txIds = per-face values from bucket-A's pass-2 texture index, bucket-B's pass-2 idx, ...
-				if (not twoStageHandled) and useW3DMatl and (meshes[i].matlPasses != undefined) and (meshes[i].matlPasses.count >= 2) and (meshes[i].shaders != undefined) and (meshes[i].vertMatls != undefined) and (numTextures > 1) do
-				(
-					local mPs2 = meshes[i].matlPasses
-					local nPasses2 = mPs2.count
-					local nFaces2 = meshes[i].faces.count
-					if debugOutput do format "  [mxBranch] entered: nPasses=% nFaces=% numTextures=% useW3DMatl=%\n" nPasses2 nFaces2 numTextures useW3DMatl
-					-- collect per-pass uniform vm/shader and per-face txIds (1-based for max indexing)
-					local mxVmIx = #()			-- one per pass
-					local mxShIx = #()			-- one per pass
-					local mxFaceTex = #()		-- mxFaceTex[p][f] = 1-based texture index for face f in pass p
-					local mxOk = true
-					for p = 1 to nPasses2 while mxOk do
-					(
-						local pp = mPs2[p]
-						if pp == undefined do ( mxOk = false; exit )
-						local vIds = pp.vmIds
-						local sIds = pp.shaderIds
-						-- vm uniformity per pass
-						local vmUniform = true
-						if vIds == undefined or vIds.count == 0 do ( mxOk = false; exit )
-						for k = 2 to vIds.count while vmUniform do ( if vIds[k] != vIds[1] do vmUniform = false )
-						if not vmUniform do ( mxOk = false; exit )
-						-- shader uniformity per pass
-						local shUniform = true
-						if sIds == undefined or sIds.count == 0 do ( mxOk = false; exit )
-						for k = 2 to sIds.count while shUniform do ( if sIds[k] != sIds[1] do shUniform = false )
-						if not shUniform do ( mxOk = false; exit )
-						-- need a single texture stage with a per-face txIds (or short-form uniform)
-						local stages2 = pp.textureStages
-						if (stages2 == undefined) or (stages2.count == 0) do
-						(
-							if pp.textureStage != undefined then ( stages2 = #(pp.textureStage) ) else ( stages2 = #() )
-						)
-						-- only handle 1 texture stage per pass in this branch (stage1 not supported here yet)
-						if stages2.count != 1 do ( mxOk = false; exit )
-						local stg2 = stages2[1]
-						if stg2 == undefined or stg2.txIds == undefined or stg2.txIds.count == 0 do ( mxOk = false; exit )
-						-- build per-face texture-index array (1-based). Short-form (count==1) means uniform.
-						local faceTex = #()
-						if stg2.txIds.count == 1 then
-						(
-							for f = 1 to nFaces2 do append faceTex (stg2.txIds[1] + 1)
-						)
-						else if stg2.txIds.count == nFaces2 then
-						(
-							for f = 1 to nFaces2 do append faceTex (stg2.txIds[f] + 1)
-						)
-						else
-						(
-							-- unexpected count; bail
-							mxOk = false; exit
-						)
-						-- validate every per-face index is in range
-						local rangeOk = true
-						for f = 1 to nFaces2 while rangeOk do
-						( if (faceTex[f] < 1) or (faceTex[f] > meshes[i].textures.count) do rangeOk = false )
-						if not rangeOk do ( mxOk = false; exit )
-						-- validate vm/shader range
-						local vmIxC = vIds[1] + 1
-						local shIxC = sIds[1] + 1
-						if (vmIxC < 1) or (vmIxC > meshes[i].vertMatls.count) do ( mxOk = false; exit )
-						if (shIxC < 1) or (shIxC > meshes[i].shaders.count) do ( mxOk = false; exit )
-						append mxVmIx vmIxC
-						append mxShIx shIxC
-						append mxFaceTex faceTex
-						if debugOutput do format "  [mxBranch] pass[%] OK: vm=% sh=% txIds.count=%\n" p vmIxC shIxC stg2.txIds.count
-					)
-					if debugOutput do format "  [mxBranch] mxOk=% mxFaceTex.count=%\n" mxOk mxFaceTex.count
-					if mxOk do
-					(
-						-- group faces into buckets by their (pass1.tex, pass2.tex, ..., passN.tex) tuple.
-						-- bucketKeys is parallel to bucketIxPerPass: bucketKeys[k] is the key string,
-						-- bucketIxPerPass[k] is an array (one tex index per pass) for that bucket.
-						local bucketKeys = #()
-						local bucketIxPerPass = #()
-						local faceBucketId = #()
-						for f = 1 to nFaces2 do
-						(
-							local key = ""
-							local ixs = #()
-							for p = 1 to nPasses2 do
-							(
-								append ixs mxFaceTex[p][f]
-								key = key + (mxFaceTex[p][f] as string) + ","
-							)
-							local b = findItem bucketKeys key
-							if b == 0 then
-							(
-								append bucketKeys key
-								append bucketIxPerPass ixs
-								b = bucketKeys.count
-							)
-							append faceBucketId b
-						)
-						-- only fire this branch when there's actually >1 bucket (otherwise the uniform
-						-- detector would already have caught it) and bucket count <= 4 passes' worth of
-						-- usable W3DMaterial subs (no hard cap on subs themselves).
-						if debugOutput do format "  [mxBranch] bucketKeys.count=%\n" bucketKeys.count
-						if bucketKeys.count >= 2 do
-						(
-							-- shader -> blendmode classifier (inlined; MAXScript disallows local fn cross-refs)
-							local mxBms = #()
-							for p = 1 to nPasses2 do
-							(
-								local sh = meshes[i].shaders[mxShIx[p]]
-								local bm = 0
-								if sh == undefined then bm = 0
-								else if (sh.srcBlend == 2) and (sh.destBlend == 5) then bm = (if sh.alphaTest != 0 then 7 else 5)
-								else if sh.alphaTest != 0 then bm = 6
-								else if (sh.srcBlend == 1) and (sh.destBlend == 0) then bm = 0
-								else if (sh.srcBlend == 1) and (sh.destBlend == 1) then bm = 1
-								else if (sh.srcBlend == 0) and (sh.destBlend == 2) then bm = 2
-								else if (sh.srcBlend == 1) and (sh.destBlend == 2) then bm = 3
-								else if (sh.srcBlend == 1) and (sh.destBlend == 3) then bm = 4
-								else bm = 8
-								append mxBms bm
-							)
-							-- build one multi-pass W3DMaterial per bucket
-							local mxSubs = #()
-							local mxSubsOk = true
-							for b = 1 to bucketKeys.count while mxSubsOk do
-							(
-								local ixs = bucketIxPerPass[b]
-								-- per-pass arrays for buildMultiPassW3DMatl
-								local bVms = #()
-								local bTex0 = #()
-								local bTex1 = #()
-								local bBms = #()
-								for p = 1 to nPasses2 do
-								(
-									append bVms meshes[i].vertMatls[mxVmIx[p]]
-									append bTex0 meshes[i].textures[ixs[p]].txFileName
-									append bTex1 ""
-									append bBms mxBms[p]
-								)
-								local subName = meshes[i].header.meshName + "_bucket" + (b as string)
-								local sub = buildMultiPassW3DMatl subName bVms bTex0 bTex1 bBms
-								if sub == undefined do ( mxSubsOk = false; exit )
-								append mxSubs sub
-							)
-							if debugOutput do format "  [mxBranch] subs built: mxSubsOk=% subs.count=% expected=%\n" mxSubsOk mxSubs.count bucketKeys.count
-							if mxSubsOk and mxSubs.count == bucketKeys.count do
-							(
-								local mxMulti = multiMaterial numsubs:bucketKeys.count name:meshes[i].header.meshName
-								for b = 1 to bucketKeys.count do
-								(
-									mxMulti.materialList[b] = mxSubs[b]
-									mxMulti.names[b] = mxSubs[b].name
-								)
-								gmMeshes[i].material = mxMulti
-								-- assign per-face matIDs to bucket index
-								for f = 1 to nFaces2 do ( setFaceMatID gmMeshes[i] f faceBucketId[f] )
-								update gmMeshes[i]
-								twoStageHandled = true
-								if debugOutput do
-								(
-									format "  -> multi-sub x multi-pass: % buckets, % passes each:\n" bucketKeys.count nPasses2
-									for b = 1 to bucketKeys.count do
-									(
-										local ixs = bucketIxPerPass[b]
-										format "       bucket[%]: " b
-										for p = 1 to nPasses2 do
-										( format "pass%-tex=% (bm=%) " p meshes[i].textures[ixs[p]].txFileName mxBms[p] )
-										format "\n"
+										wwSetTexFlags  w3dMatl pass stage tex.txInfo.attrs
+										wwSetAnimType  w3dMatl pass stage tex.txInfo.animType
+										wwSetFrames    w3dMatl pass stage tex.txInfo.frameCount
+										wwSetFrameRate w3dMatl pass stage tex.txInfo.frameRate
 									)
 								)
 							)
@@ -2761,399 +1905,181 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 					)
 				)
 
-				if twoStageHandled then
+				-- faceTexIndex: read face f's 0-based texture index for (pIdx,sIdx).
+				fn faceTexIndex mesh pIdx sIdx f =
 				(
-					-- already assigned a single two-stage / two-pass W3DMaterial; skip the multi-material path
+					local mp = mesh.matlPasses[pIdx]
+					if mp.textureStages == undefined or mp.textureStages.count < sIdx then 0 else
+					(
+						local ts = mp.textureStages[sIdx]
+						if ts.txIds == undefined or ts.txIds.count == 0 then 0
+						else if ts.txIds.count == 1 then ts.txIds[1]
+						else if f >= 1 and f <= ts.txIds.count then ts.txIds[f]
+						else ts.txIds[1]
+					)
 				)
-				else if numTextures > 1 then
+
+				local firstMatName = meshes[i].vertMatls[1].vmName
+
+				-- uvTargets: list of W3D materials that need wwSetUV calls in
+				-- the per-stage UV loop below. Single-material path: 1 entry.
+				-- Multimaterial path: every W3D submat (they share UVs).
+				local uvTargets = #()
+
+				if hasPerFaceTex then
 				(
-					-- build a MultiMaterial with one sub-material per texture
-					baseVm = meshes[i].vertMatls[1]
-					gmMultiMatl = multiMaterial numsubs:numTextures name:meshes[i].header.meshName
-					for m = 1 to numTextures do
+					-- Build face -> tupleKey, dedupe to submat list, then assign matIDs.
+					local tupleKeys = #()
+					local faceMatID  = #()
+					if nf > 0 do faceMatID[nf] = 1
+					for f = 1 to nf do
 					(
-						-- pick a vertex material if available, else reuse the first
-						vmIx = m
-						if vmIx > meshes[i].vertMatls.count do vmIx = 1
-						curVm = meshes[i].vertMatls[vmIx]
-
-						subName = curVm.vmName + "_" + (meshes[i].textures[m].txFileName)
-						subMatl = undefined
-						if useW3DMatl do
+						local key = ""
+						for pIdx = 1 to passCount do
 						(
-							local subBlendMode = pickBlendModeForSub meshes[i] m meshBlendMode
-							if debugOutput do
+							local mp = meshes[i].matlPasses[pIdx]
+							local stageCnt = if mp.textureStages != undefined then mp.textureStages.count else 0
+							for sIdx = 1 to stageCnt do
 							(
-								local subBmLabel = "Opaque"
-								case subBlendMode of
-								(
-									0: subBmLabel = "Opaque"
-									1: subBmLabel = "Add"
-									2: subBmLabel = "Multiply"
-									3: subBmLabel = "MultiplyAndAdd"
-									4: subBmLabel = "Screen"
-									5: subBmLabel = "AlphaBlend"
-									6: subBmLabel = "AlphaTest"
-									7: subBmLabel = "AlphaTestAndBlend"
-									8: subBmLabel = "Custom"
-								)
-								format "  -> sub[%] tex=% picked blendmode=% (%)\n" m meshes[i].textures[m].txFileName subBlendMode subBmLabel
+								local ti = faceTexIndex meshes[i] pIdx sIdx f
+								key = key + (ti as string) + ","
 							)
-							subMatl = buildW3DMatl subName curVm meshes[i].textures[m].txFileName subBlendMode
+							key = key + ";"
 						)
-
-						if subMatl == undefined then
+						local idx = findItem tupleKeys key
+						if idx == 0 do
 						(
-							-- per-sub blendmode classification (same logic as W3D material path).
-							-- Without this every sub inherits the mesh-wide meshAlpha/meshAdditive flag,
-							-- which is wrong when a mesh has e.g. one Opaque base + one Add glow sub.
-							local subBlendModeS = pickBlendModeForSub meshes[i] m 0
-							local subAlpha = (subBlendModeS == 5) or (subBlendModeS == 7)
-							local subAdditive = (subBlendModeS == 1)
-							local subAlphaTest = (subBlendModeS == 6) or (subBlendModeS == 7)
-
-							subMatl = standardMaterial name:subName
-							subMatl.ambient = curVm.vmInfo.ambient
-							subMatl.diffuse = curVm.vmInfo.diffuse
-							subMatl.specular = curVm.vmInfo.specular
-							subMatl.glossiness = curVm.vmInfo.shininess * 100
-							subMatl.opacity = curVm.vmInfo.opacity * 100
-							diffuseTex = bitmaptex filename:meshes[i].textures[m].txFileName
-							-- default the diffuse bitmap to alphaSource = None so opaque meshes don't
-							-- accidentally render transparent because the .dds carries an alpha channel.
-							-- The alpha / additive branches below rely on this being None, so it's safe
-							-- to set unconditionally here.
-							try ( diffuseTex.alphaSource = 2 ) catch () -- 0=Image,1=RGB Intensity,2=None(Opaque)
-							subMatl.diffuseMap = diffuseTex
-							showTextureMap subMatl subMatl.diffuseMap true
-
-							-- if this sub uses alpha, wire opacity to the same bitmap with mono output = Alpha
-							if subAlpha do
-							(
-								opTex = bitmaptex filename:meshes[i].textures[m].txFileName
-								opTex.monoOutput = 1 -- 0=RGB Intensity, 1=Alpha
-								subMatl.opacityMap = opTex
-								showTextureMap subMatl subMatl.opacityMap true
-							)
-							-- additive blending: assign texture to opacity and self-illumination, with selfIllumColor on
-							if subAdditive do
-							(
-								addOpTex = bitmaptex filename:meshes[i].textures[m].txFileName
-								subMatl.opacityMap = addOpTex
-								showTextureMap subMatl subMatl.opacityMap true
-
-								addSiTex = bitmaptex filename:meshes[i].textures[m].txFileName
-								subMatl.selfIllumMap = addSiTex
-								showTextureMap subMatl subMatl.selfIllumMap true
-
-								try ( subMatl.useSelfIllumColor = true ) catch ()
-
-								if debugOutput do
-								( format "  -> sub[%] additive: opacity+selfIllum maps wired\n" m )
-							)
-							if debugOutput do
-							(
-								local sbLabel = "Opaque"
-								case subBlendModeS of
-								(
-									1: sbLabel = "Add"
-									2: sbLabel = "Multiply"
-									3: sbLabel = "MultiplyAndAdd"
-									4: sbLabel = "Screen"
-									5: sbLabel = "AlphaBlend"
-									6: sbLabel = "AlphaTest"
-									7: sbLabel = "AlphaTestAndBlend"
-									8: sbLabel = "Custom"
-								)
-								format "  -> std sub[%] tex=% blendmode=% (%) alpha=% additive=%\n" m meshes[i].textures[m].txFileName subBlendModeS sbLabel subAlpha subAdditive
-							)
+							append tupleKeys key
+							idx = tupleKeys.count
 						)
-
-						gmMultiMatl.materialList[m] = subMatl
-						gmMultiMatl.materialIDList[m] = m
-						gmMultiMatl.names[m] = subName
-					)
-					gmMeshes[i].material = gmMultiMatl
-
-					-- assign per-face material IDs from txIds (0-based in w3d, 1-based in max)
-					txIdList = undefined
-					if (meshes[i].matlPass != undefined) and (meshes[i].matlPass.textureStage != undefined) do
-					( txIdList = meshes[i].matlPass.textureStage.txIds )
-
-					if txIdList != undefined then
-					(
-						if txIdList.count == 1 then
-						(
-							for f = 1 to meshes[i].faces.count do
-							( setFaceMatID gmMeshes[i] f (txIdList[1] + 1) )
-						)
-						else
-						(
-							for f = 1 to meshes[i].faces.count do
-							(
-								if f <= txIdList.count do
-								( setFaceMatID gmMeshes[i] f (txIdList[f] + 1) )
-							)
-						)
-						update gmMeshes[i]
+						faceMatID[f] = idx
 					)
 
-					-- "No Multi-Mat" splitter: instead of leaving the mesh with a multi-material,
-					-- split it into separate mesh objects (one per matID actually used), each
-					-- with a single material assigned. Builds every bucket as a new mesh from
-					-- the W3D source data (verts, faces, normals, txCoords) and then deletes
-					-- the original node entirely. This is more reliable than mutating the
-					-- original via meshOp.deleteFaces, which corrupts the TVFace/normal arrays
-					-- and triggers "TVFace index out of range" errors downstream.
-					if noMultiMat do
+					local multi = Multimaterial name:firstMatName numsubs:tupleKeys.count
+					append sceneMaterials multi
+
+					for k = 1 to tupleKeys.count do
 					(
-						try
+						local txOverride = #()
+						local passParts = filterString tupleKeys[k] ";"
+						for pIdx = 1 to passParts.count do
 						(
-							-- Snapshot the W3D source data for this mesh.
-							local srcVertsW = meshes[i].verts
-							local srcNormalsW = meshes[i].normals
-							local srcFacesW = meshes[i].faces -- array of W3dMeshFace (vertIds is 0-based)
-							local srcTxCoordsW = undefined
-							if (meshes[i].matlPass != undefined) and (meshes[i].matlPass.textureStage != undefined) and (meshes[i].matlPass.textureStage.txCoords != undefined) do
-								srcTxCoordsW = meshes[i].matlPass.textureStage.txCoords
-
-							-- bucket faces by matID using the live mesh's per-face IDs (these were
-							-- assigned just above from txIdList).
-							local matIdBuckets = #()
-							local matIdList2 = #()
-							for f = 1 to gmMeshes[i].numFaces do
-							(
-								local mid = getFaceMatID gmMeshes[i] f
-								local idx = findItem matIdList2 mid
-								if idx == 0 then
-								(
-									append matIdList2 mid
-									append matIdBuckets #{f}
-								)
-								else
-								(
-									matIdBuckets[idx][f] = true
-								)
-							)
-
-							if matIdList2.count > 1 then
-							(
-								local origName = gmMeshes[i].name
-								local origParent = gmMeshes[i].parent
-								local origTransform = gmMeshes[i].transform
-								local createdNames = #()
-								local createdNodes = #()
-
-								for k = 1 to matIdList2.count do
-								(
-									local mid = matIdList2[k]
-									local newName = origName + " [matID " + (mid as string) + "]"
-									local bucketFaces = matIdBuckets[k]
-
-									-- Collect this bucket's face vertex-index triples (1-based) and
-									-- the unique source vert IDs they use.
-									local usedVerts = #{}
-									local faceTris = #()
-									for f in bucketFaces do
-									(
-										-- W3D vertIds are 0-based; +1 to match MAXScript indexing.
-										local v0 = (srcFacesW[f].vertIds.x as integer) + 1
-										local v1 = (srcFacesW[f].vertIds.y as integer) + 1
-										local v2 = (srcFacesW[f].vertIds.z as integer) + 1
-										append faceTris #(f, v0, v1, v2)
-										usedVerts[v0] = true
-										usedVerts[v1] = true
-										usedVerts[v2] = true
-									)
-
-									-- Compact: only carry the verts this bucket actually uses.
-									local oldToNew = #()
-									local newVerts = #()
-									local newNormals = #()
-									for v in usedVerts do
-									(
-										append newVerts srcVertsW[v]
-										if srcNormalsW != undefined and v <= srcNormalsW.count do
-											append newNormals srcNormalsW[v]
-										oldToNew[v] = newVerts.count
-									)
-
-									local newFaces = #()
-									for tri in faceTris do
-										append newFaces [oldToNew[tri[2]], oldToNew[tri[3]], oldToNew[tri[4]]]
-
-									local newNode = undefined
-									try ( newNode = mesh name:newName vertices:newVerts faces:newFaces ) catch ()
-
-									if newNode != undefined then
-									(
-										-- per-vert normals
-										for v = 1 to newNormals.count do
-										( try ( setNormal newNode v newNormals[v] ) catch () )
-
-										-- texture vertices (UVs) — copy txCoords for the used verts.
-										if srcTxCoordsW != undefined do
-										(
-											try
-											(
-												setNumTVerts newNode newVerts.count
-												buildTVFaces newNode
-												local idxList = #()
-												for v in usedVerts do append idxList v
-												for j = 1 to idxList.count do
-												(
-													local sv = idxList[j]
-													if sv <= srcTxCoordsW.count do
-													(
-														local uv = srcTxCoordsW[sv]
-														setTVert newNode j (Point3 uv.x uv.y 0)
-													)
-												)
-												-- setTVFace expects three integer args, not a Point3.
-												for fIx = 1 to newFaces.count do
-												(
-													local nf = newFaces[fIx]
-													setTVFace newNode fIx (nf.x as integer) (nf.y as integer) (nf.z as integer)
-												)
-											) catch ()
-										)
-
-										try ( newNode.material = gmMultiMatl.materialList[mid] ) catch ()
-										try ( newNode.transform = origTransform ) catch ()
-										try ( newNode.parent = origParent ) catch ()
-										update newNode
-										append createdNames newName
-										append createdNodes newNode
-										if debugOutput do
-											format "    -> created matID % node=% (verts=% faces=%) at pos=%\n" mid newNode.name newVerts.count newFaces.count newNode.pos
-									)
-									else
-									(
-										if debugOutput do
-											format "    -> matID % FAILED to create new mesh node\n" mid
-									)
-								)
-
-								-- Replace the original in gmMeshes so downstream post-processing
-								-- (normals reset, fix vertices, HLOD reparent) operates on a real
-								-- node instead of the soon-to-be-deleted original. Pick the first
-								-- created node as the representative.
-								if createdNodes.count > 0 then
-								(
-									try ( delete gmMeshes[i] ) catch ()
-									gmMeshes[i] = createdNodes[1]
-									noMultiMatHandled = true
-								)
-
-								if debugOutput do
-									format "  -> No Multi-Mat: split [%] into % mesh(es): %\n" origName createdNames.count createdNames
-							)
-							else
-							(
-								if debugOutput do
-									format "  -> No Multi-Mat: [%] only uses 1 matID, no split needed\n" gmMeshes[i].name
-							)
+							local stageParts = filterString passParts[pIdx] ","
+							txOverride[pIdx] = #()
+							for sIdx = 1 to stageParts.count do
+								txOverride[pIdx][sIdx] = ((stageParts[sIdx] as integer) + 1)
 						)
-						catch
+
+						local subName = firstMatName
+						if txOverride[1] != undefined and txOverride[1][1] != undefined and txOverride[1][1] >= 1 and txOverride[1][1] <= textureCount and meshes[i].textures[txOverride[1][1]] != undefined do
 						(
-							if debugOutput do
-								format "  -> No Multi-Mat [%]: FAILED with error: %\n" meshes[i].header.meshName (getCurrentException())
+							local fn0 = meshes[i].textures[txOverride[1][1]].txFileName
+							if fn0 != undefined and fn0 != "" do subName = fn0
 						)
+
+						local sub = W3D name:subName
+						wwSetSortLevel   sub sortLevel
+						wwSetSurfaceType sub surfaceType
+						wwSetPassCount   sub passCount
+						applyW3DPassParams sub meshes[i] passCount vmCount shaderCount textureCount txOverride
+
+						multi.materialList[k] = sub
+						multi.names[k] = subName
+						append uvTargets sub
 					)
+
+					gmMeshes[i].material = multi
+					for f = 1 to nf do setFaceMatID gmMeshes[i] f faceMatID[f]
 				)
 				else
 				(
-					gmMatl = undefined
-					matlName = meshes[i].vertMatls[1].vmName
+					-- Build a fresh W3D material per mesh. Reuse-by-name was removed
+					-- because vertex-material names (e.g. "Strip Concrete", "Red
+					-- Cement") repeat across meshes that reference different texture
+					-- files -- matching by name caused the second mesh to inherit
+					-- the first mesh's textures.
+					local w3dMatl = W3D name:firstMatName
+					append sceneMaterials w3dMatl
+					wwSetSortLevel   w3dMatl sortLevel
+					wwSetSurfaceType w3dMatl surfaceType
+					wwSetPassCount   w3dMatl passCount
+					applyW3DPassParams w3dMatl meshes[i] passCount vmCount shaderCount textureCount undefined
+					gmMeshes[i].material = w3dMatl
+					append uvTargets w3dMatl
+				)
 
-					if userSeparateMaterial or (sceneMaterials[matlName] == undefined) then
+				-- Per-stage UV channel assignment + UV data setup. Each TEXTURE_STAGE
+				-- carries its own per-vertex UVs in stage.txCoords. Stage 0 of pass 0
+				-- maps to Max channel 1 by convention; subsequent stages get unique
+				-- channel IDs so the W3D material's two-stage param blocks pick the
+				-- right coordinates.
+				local nv = meshes[i].verts.count
+
+				-- Count how many UV channels we'll consume so we can grow the mesh's map
+				-- count up front. meshOp.setMapSupport on a channel beyond getNumMaps()
+				-- raises "Map channel index outside valid range" -- the map count must
+				-- be expanded with meshop.setNumMaps before any per-channel write.
+				local channelsNeeded = 0
+				for pIdx = 1 to passCount do
+				(
+					local mp = meshes[i].matlPasses[pIdx]
+					if mp.textureStages != undefined do
 					(
-						-- Try W3D Tools material first when requested
-						if useW3DMatl do
+						for sIdx = 1 to mp.textureStages.count do
 						(
-							local texFile = ""
-							if (meshes[i].textures != undefined) and (meshes[i].textures.count > 0) do
-							( texFile = meshes[i].textures[1].txFileName )
-							gmMatl = buildW3DMatl matlName meshes[i].vertMatls[1] texFile meshBlendMode
+							local ts = mp.textureStages[sIdx]
+							if ts.txCoords != undefined and ts.txCoords.count > 0 do
+								channelsNeeded += 1
 						)
-
-						if gmMatl != undefined then
-						(
-							append sceneMaterials gmMatl
-						)
-						else
-						(
-						gmMatl = standardMaterial name:matlName
-						gmMatl.ambient = meshes[i].vertMatls[1].vmInfo.ambient
-						gmMatl.diffuse = meshes[i].vertMatls[1].vmInfo.diffuse
-						gmMatl.specular = meshes[i].vertMatls[1].vmInfo.specular
-						--gmMatl.emissive = meshes[i].vertMatls[1].vmInfo.emissive
-						gmMatl.glossiness = meshes[i].vertMatls[1].vmInfo.shininess * 100
-						gmMatl.opacity = meshes[i].vertMatls[1].vmInfo.opacity * 100
-						--gmMatl.translucency = meshes[i].vertMatls[1].vmInfo.translucency
-						if (meshes[i].textures != undefined) and (meshes[i].textures.count > 0) then
-						(
-							diffuseTex = bitmaptex filename:meshes[i].textures[1].txFileName
-							-- default alphaSource = None so opaque meshes don't render transparent
-							-- when the bitmap carries an alpha channel (alpha/additive branches below
-							-- expect this to be None as well, so it's safe to set unconditionally).
-							try ( diffuseTex.alphaSource = 2 ) catch () -- 0=Image,1=RGB Intensity,2=None(Opaque)
-							gmMatl.diffuseMap = diffuseTex
-							showTextureMap gmMatl gmMatl.diffuseMap true
-
-							if meshAlpha do
-							(
-								opTex = bitmaptex filename:meshes[i].textures[1].txFileName
-								opTex.monoOutput = 1 -- Alpha
-								gmMatl.opacityMap = opTex
-								showTextureMap gmMatl gmMatl.opacityMap true
-							)
-							if meshAdditive do
-							(
-								addOpTex = bitmaptex filename:meshes[i].textures[1].txFileName
-								gmMatl.opacityMap = addOpTex
-								showTextureMap gmMatl gmMatl.opacityMap true
-
-								addSiTex = bitmaptex filename:meshes[i].textures[1].txFileName
-								gmMatl.selfIllumMap = addSiTex
-								showTextureMap gmMatl gmMatl.selfIllumMap true
-
-								try ( gmMatl.useSelfIllumColor = true ) catch ()
-
-								if debugOutput do
-								( format "  -> additive: opacity+selfIllum maps wired\n" )
-							)
-						)
-						append sceneMaterials gmMatl
-						)  -- end inner else (standardMaterial fallback)
 					)
-					else
+				)
+				if channelsNeeded > 0 do
+				(
+					-- Channels are 1-based for user maps; getNumMaps returns the highest
+					-- valid index + 1, so for channels 1..N we need NumMaps = N + 1.
+					local needNumMaps = channelsNeeded + 1
+					if (meshop.getNumMaps gmMeshes[i]) < needNumMaps do
+						meshop.setNumMaps gmMeshes[i] needNumMaps keep:true
+				)
+
+				local uvChannel = 1
+				for pIdx = 1 to passCount do
+				(
+					local pass = pIdx - 1
+					local mp = meshes[i].matlPasses[pIdx]
+					if mp.textureStages != undefined do
 					(
-						gmMatl = sceneMaterials[matlName]
+						for sIdx = 1 to mp.textureStages.count do
+						(
+							local stage = sIdx - 1
+							local ts = mp.textureStages[sIdx]
+							if ts.txCoords != undefined and ts.txCoords.count > 0 do
+							(
+								meshOp.setMapSupport gmMeshes[i] uvChannel true
+								meshOp.setNumMapVerts gmMeshes[i] uvChannel ts.txCoords.count
+								for v = 1 to ts.txCoords.count do
+								(
+									-- ReadMeshTextureCoordArray returns Point2 values, not W3dMeshTextureCoord
+									-- structs, so the UV components live at .x / .y (not .u / .v).
+									local tc = ts.txCoords[v]
+									meshOp.setMapVert gmMeshes[i] uvChannel v (Point3 tc.x tc.y 0)
+								)
+								meshOp.setNumMapFaces gmMeshes[i] uvChannel nf
+								for f = 1 to nf do
+								(
+									meshOp.setMapFace gmMeshes[i] uvChannel f gmFaces[f]
+								)
+								for tgt in uvTargets do wwSetUV tgt pass stage uvChannel
+								uvChannel += 1
+							)
+						)
 					)
-					gmMeshes[i].material = gmMatl
 				)
 			)
 			
-			-- map a texture at v1.02
-			-- Skip when No Multi-Mat already replaced gmMeshes[i] with a split node:
-			-- the split path already set up its own per-bucket UVs/normals, and the
-			-- original-sized arrays here would index out of range on the smaller node.
-			if not noMultiMatHandled and (meshes[i].matlPass != undefined) and (meshes[i].matlPass.textureStage != undefined) and (meshes[i].matlPass.textureStage.txCoords != undefined) then
-			(
-				numTVerts = meshes[i].matlPass.textureStage.txCoords.count
-				setNumTVerts gmMeshes[i] numTVerts
-				for v = 1 to numTVerts do
-				(
-					txCoord = meshes[i].matlPass.textureStage.txCoords[v]
-					setTVert gmMeshes[i] v (Point3 txCoord.x txCoord.y 0)
-				)
-				numTFaces = meshes[i].faces.count
-				buildTVFaces gmMeshes[i]
-
-				for f = 1 to numTFaces do
-				( setTVFace gmMeshes[i] f gmFaces[f] )
-			)
+			-- (Legacy single-stage texture-coord block removed: the W3D-material
+			-- builder above already sets per-stage UVs via meshOp.setMapVert and
+			-- registers the channel with wwSetUV.)
 
 			-- set vert normals at v1.03
 			if not noMultiMatHandled do
@@ -4281,7 +3207,7 @@ rollout rltMain "W3D Importer" width:177 height:292
 	(
 		if st do ckbFixNormals.checked = false
 	)
-
+	
 	on ckbSplitDependencies changed state do
 	( if ckbSplitDependencies.checked then ckbAutoBind.checked = false )
 	

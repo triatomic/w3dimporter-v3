@@ -4,7 +4,7 @@ A MAXScript importer for Westwood 3D (`.w3d`) files in 3ds Max / gMax.
 
 Originally scripted by **coolfile**, edited and augmented by **NDC**, further edited by **tria**.
 
-## **Note:** versions after v8 require the modified W3D Tools (rebuilt `max2w3d.dle`) from [https://github.com/triatomic/max2w3d](https://github.com/triatomic/max2w3d) to function properly.
+# **Note:** versions after v8 require the modified W3D Tools (rebuilt `max2w3d.dle`) from [https://github.com/triatomic/max2w3d](https://github.com/triatomic/max2w3d) to function properly.
 
 Tested on 3ds Max 2023.
 
@@ -12,6 +12,9 @@ Tested on 3ds Max 2023.
 
 - [w3dimporter](#w3dimporter)
   - [Usage](#usage)
+  - [Changelog (v17.1 vs v17)](#changelog-v171-vs-v17)
+    - [Use 3dsMax8 Normals removed](#use-3dsmax8-normals-removed)
+    - [Fix Normals + Fix Vertices interaction fixed](#fix-normals--fix-vertices-interaction-fixed)
   - [Changelog (v17 vs v11)](#changelog-v17-vs-v11)
     - [Import extended W3D Info](#import-extended-w3d-info)
     - [Pivots dropdown (Basic tab)](#pivots-dropdown-basic-tab)
@@ -62,9 +65,31 @@ Tested on 3ds Max 2023.
 2. The "W3D Importer" dialog opens. Click**Import a file** and pick a`.w3d`.
 3. The dialog has two tabs:
    - **Basic** — Split by dependencies, Auto-Bind, Auto-Bind type (max skin / w3d skin), Batch processing.
-   - **Advanced** — Use W3D Materials, Debug Output, Strict Mode, Fix Normals, tga2DDS (with`rev` companion), Fix Vertices, No Multi-Mat.
+   - **Advanced** — Use W3D Materials, Debug Output, Import extended W3D Info, Strict Mode, Fix Normals, tga2DDS (with`rev` companion), Fix Vertices, No Multi-Mat, Use 2023WWSkin, Use External Skeleton.
 
 If a runtime error inside an import leaves the dialog's buttons unresponsive, type `w3di.reload()` in the MAXScript Listener to rebuild the dialog.
+
+</details>
+
+<details id="changelog-v171-vs-v17">
+<summary><h2>Changelog (v17.1 vs v17)</h2></summary>
+
+### Use 3dsMax8 Normals removed
+
+The **Use 3dsMax8 Normals** checkbox is gone, along with the `wwMakeNormalsExplicit` call site in both `w3dimporter.ms` and `w3dimporter_renegade.ms`. The feature did not reproduce 3ds Max 8's `RVertex` per-vertex normal shading on Max 2023's `MeshNormalSpec` pipeline: marking every spec normal Explicit only flips a flag, but the spec's per-face-corner table is still routed by smoothing groups during `CheckNormals`, so corners that Max 8 would have shared can split (and vice versa). The result was that imported meshes still shaded differently from Max 8 even with the box checked. The function signature, dialog checkbox, mutual-exclusion handlers, and basic/advanced visibility toggle have all been removed; the remaining checkboxes shift up to close the gap.
+
+The `wwMakeNormalsExplicit` primitive itself is left in `max2w3d.dle` because the older `w3dimporterv8.ms` still references it.
+
+### Fix Normals + Fix Vertices interaction fixed
+
+Running both **Fix Normals** and **Fix Vertices** in the same import produced wrong shading on the output model. Fix Vertices assigns a unique smoothing group per connected element so welded element seams keep their hard edges, then Fix Normals would force every face to SG 1 before its `Edit_Normals → Reset` pass — wiping out the per-element split and bleeding shading across element seams.
+
+Two changes:
+
+- The two checkboxes are now mutually exclusive in the dialog. Enabling one auto-unchecks the other.
+- As a safety net for programmatic callers, Fix Normals' `setFaceSmoothGroup f 1` baseline is skipped when `fixVertices` is true. `Edit_Normals → Reset` then operates on whatever SGs are in place, preserving Fix Vertices' per-element edges.
+
+Both fixes apply to `w3dimporter.ms` and `w3dimporter_renegade.ms`.
 
 </details>
 
@@ -91,6 +116,8 @@ When the HLOD header references an external rig (HTree name differs from the HLO
 
 ### Use 3dsMax8 Normals now works on WWSkin meshes
 
+> **Removed in v17.1:** the entire **Use 3dsMax8 Normals** feature has been removed from the importer. The notes below describe what it used to do.
+
 The `wwMakeNormalsExplicit` skip list is narrowed to native **Skin / Physique** only. Previously WWSkin was skipped too. The rebuilt `SkinModifierClass::ModifyObject` in `max2w3d.dle` now (a) sets `MESH_NORMAL_MODIFIER_SUPPORT` so Max doesn't auto-clear Explicit normals, and (b) re-skins each Explicit base-mesh normal by `Inverse(baseTM) * curTM` of its driving bone every evaluation, so explicit normals follow the rig instead of staying frozen in bind pose. Skin / Physique still recompute normals on evaluation and discard explicit base-mesh normals, so they remain skipped.
 
 ### Credits
@@ -103,6 +130,8 @@ Header comment updated to credit **Seagle & Sloth** for the v11→v17 contributi
 <summary><h2>Changelog (v11 vs v10)</h2></summary>
 
 ### Use 3dsMax8 Normals
+
+> **Removed in v17.1:** the entire **Use 3dsMax8 Normals** feature has been removed from the importer. The notes below describe what it used to do.
 
 New **Use 3dsMax8 Normals** checkbox (Advanced tab, on by default). After import, promotes the per-vertex normals written from the W3D file to Explicit in the base mesh's `MeshNormalSpec` via the `wwMakeNormalsExplicit` primitive in the rebuilt `max2w3d.dle`. Without this, Max 2023's Nitrous renderer re-derives normals from smoothing groups, making imported meshes look different from Max 8 (which used the legacy `RVertex/RNormal` path directly).
 
