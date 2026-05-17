@@ -16,9 +16,27 @@
 struct W3DImporterNamespace ( fn reload =
 (
 	try ( destroyDialog rltMain ) catch ()
-	createDialog rltMain
+	createDialog rltMain menu:rltMainMenu
 ))
 global w3di = W3DImporterNamespace()
+
+-- Forward declarations: these globals are assigned further down the file
+-- (W3DImporterInit at ~line 5341, rnPendingFile at ~line 6182) but are
+-- referenced inside function/rollout bodies defined above those assignments
+-- (cfW3DImporter at ~line 1853, rltMain handler at ~line 6177). Manual
+-- `Evaluate All` from the editor tolerates this because the whole buffer
+-- runs in one shared scope; but 3ds Max's scripts/startup/ autoload
+-- compiles function bodies before the later assignments execute, capturing
+-- the names as undefined locals. Forward-declaring them here binds the
+-- global slots up front so both paths behave identically.
+global W3DImporterInit
+global rnPendingFile
+-- rltMain is defined at ~line 5979, after rltRenegade (~line 4655) whose
+-- doImport handler reads rltMain.ckb*.checked. Under scripts/startup/ that
+-- read otherwise fails (undefined) and the try/catch around it silently
+-- defaults every Advanced-tab option to false — making the imported file
+-- appear correct but with all advanced options ignored.
+global rltMain
 
 -- reference table for adaptive delta motion channels --
 deltaTable = #()
@@ -130,9 +148,9 @@ struct Animation
 
 struct W3dMeshHeader
 (
-	version, attrs, meshName, containerName, 
-	faceCount, vertCount, matlCount, damageStageCount, 
-	sortLevel, prelitVersion, futureCount, vertChannelCount, faceChannelCount, 
+	version, attrs, meshName, containerName,
+	faceCount, vertCount, matlCount, damageStageCount,
+	sortLevel, prelitVersion, futureCount, vertChannelCount, faceChannelCount,
 	minCorner, maxCorner, sphCentre, sphRadius
 )
 
@@ -153,7 +171,7 @@ struct W3dMeshMaterialSetInfo
 )
 struct W3dMeshShader
 (
-	depthCompare, depthMask, colorMask, destBlend, fogFunc, priGradient, secGradient, srcBlend, texturing, 
+	depthCompare, depthMask, colorMask, destBlend, fogFunc, priGradient, secGradient, srcBlend, texturing,
 	detailColorFunc, detailAlphaFunc, shaderPreset, alphaTest, postDetailColorFunc, postDetailAlphaFunc, pad
 )
 
@@ -260,10 +278,19 @@ struct HLodObjectArray
 	lodObjects
 )
 
+struct HLodAggregate  --renegade
+(
+	pivotIndex,
+	name
+)
+
 struct HLod
 (
 	header,
-	lodArray
+	lodArray,
+	lodArrays,   --renegade: all LOD levels (lodArray == lodArrays[1] for Generals compat)
+	aggregates,  --renegade: 0x705 HLOD_AGGREGATE_ARRAY entries
+	proxies      --renegade: 0x706 HLOD_PROXY_ARRAY entries (pivotIndex only)
 )
 
 struct AABox
@@ -312,7 +339,7 @@ fn ReadShortArray fstream arrayEnd=
 fn ReadFixedString fstream =
 (
 	strend = (ftell fstream) + 16
-	instr = ReadString fstream 
+	instr = ReadString fstream
 	fseek fstream strend #seek_set
 	result = instr
 )
@@ -320,7 +347,7 @@ fn ReadFixedString fstream =
 fn ReadLongFixedString fstream =
 (
 	strend = (ftell fstream) + 32
-	instr = ReadString fstream 
+	instr = ReadString fstream
 	fseek fstream strend #seek_set
 	result = instr
 )
@@ -488,21 +515,21 @@ fn procDeltaBlockData fstream nBits scale initVal =
 (
 	procData = #()
 	v0 = initVal
-	
+
 	for i=1 to 2*nBits do
 	(
 		currByte = readByte fstream #unsigned
-		
+
 		if (nBits == 4) then
 		(
 			-- Splitting the byte into halves
 			lVal = bit.and currByte 0x0F
 			uVal = bit.shift currByte -4
-			
+
 			-- Restoring halves' signs (bit flipping)
 			if (lVal >= 8) do lVal -= 16
 			if (uVal >= 8) do uVal -= 16
-			
+
 			append procData (v0 + scale*lVal)
 			v0 += scale*lVal
 			append procData (v0 + scale*uVal)
@@ -516,7 +543,7 @@ fn procDeltaBlockData fstream nBits scale initVal =
 			v0 += scale*currByte
 		)
 	)
-	
+
 	return procData
 )
 
@@ -526,25 +553,25 @@ fn ReadAnimationCompressedMotionChannel fstream chunkEnd =
 	chnType = readByte fstream #unsigned
 	keyFrameChn = (chnType == 0)
 	vectorLen = readByte fstream #unsigned
-	
+
 	flags = readByte fstream #unsigned
 	values = #()
-	
+
 	nTimeCodes = readShort fstream #unsigned
 	pivotID = readShort fstream #unsigned
-	
+
 	-- Simple time key channel
 	if (keyFrameChn) then
-	(	
+	(
 		for i=1 to nTimeCodes do
 		(
 			tCode = readShort fstream #unsigned
 			values[i] = AnimationTimeCodedKey tCode 0
 		)
-		
+
 		if ((mod nTimeCodes 2) != 0) do --skipping padding
 		( fseek fstream 2 #seek_cur )
-		
+
 		for i=1 to nTimeCodes do
 		(
 			case flags of
@@ -555,24 +582,24 @@ fn ReadAnimationCompressedMotionChannel fstream chunkEnd =
 					values[i].keyValue = readFloat fstream
 			)
 		)
-		
+
 		result = AnimationTimeCodedChannel 1 nTimeCodes pivotID vectorLen flags values
 		return result
 	)
-	
+
 	-- Adaptive delta channel
 	scale = readFloat fstream
 	nBits = 4*chnType
 	nBlocks = bit.shift (nTimeCodes+15) -4 -- In how many sections are data encoded? +15 is to make sure we start from 1
-	
+
 	scaleFactor = float 1
 	if (nBits == 8) do
 	( scaleFactor /= 16 )
-	
+
 	decData = #()
 	values = #()
 	deltaTableIx = 0
-	
+
 	case flags of
 	(
 		0x0006: --ANIM_MOTION_CHANNEL_DELTA_Q
@@ -581,7 +608,7 @@ fn ReadAnimationCompressedMotionChannel fstream chunkEnd =
 			decData[2] = #(readFloat fstream)
 			decData[3] = #(readFloat fstream)
 			decData[4] = #(readFloat fstream)
-			
+
 			for i=1 to nBlocks do
 			(
 				for j=1 to 4 do
@@ -589,39 +616,39 @@ fn ReadAnimationCompressedMotionChannel fstream chunkEnd =
 					deltaTableIx = readByte fstream #unsigned
 					deltaScale = scale * scaleFactor * deltaTable[deltaTableIx+1]
 					if (deltaTableIx <= 15) do deltaScale /= 100
-					
+
 					join decData[j] (procDeltaBlockData fstream nBits deltaScale decData[j][decData[j].count])
 				)
 			)
-			
+
 			decData[1].count = nTimeCodes
 			decData[2].count = nTimeCodes
 			decData[3].count = nTimeCodes
 			decData[4].count = nTimeCodes
-			
+
 			for t=1 to decData[1].count do
 			( values[t] = AnimationTimeCodedKey (t-1) (quat decData[1][t] decData[2][t] decData[3][t] decData[4][t]) )
 		)
 		default: --ANIM_MOTION_CHANNEL_DELTA_X/Y/Z
 		(
 			decData[1] = ReadFloat fstream
-			
+
 			for i=1 to nBlocks do
 			(
 				deltaTableIx = readByte fstream #unsigned
 				deltaScale = scale * scaleFactor * deltaTable[deltaTableIx+1]
 				if (deltaTableIx <= 15) do deltaScale /= 100
-				
+
 				join decData (procDeltaBlockData fstream nBits deltaScale decData[decData.count])
 			)
-			
+
 			decData.count = nTimeCodes
-			
+
 			for t=1 to decData.count do
 			( values[t] = AnimationTimeCodedKey (t-1) (decData[t]) )
 		)
 	)
-	
+
 	result = AnimationTimeCodedChannel 1 nTimeCodes pivotID vectorLen flags values
 	return result
 )
@@ -750,7 +777,7 @@ fn ReadCompressedAnimation fstream chunkEnd =
 				(
 					0x0: --ANIM_FLAVOUR_TIMECODED
 					( channels[(channels.count + 1)] = ReadAnimationCompressedMotionChannel fstream subChunkEnd )
-					
+
 				)
 			)
 			default:
@@ -878,7 +905,7 @@ fn ReadMeshVertInfs fstream chunkEnd =
 		append boneIds2 (ReadShort fstream #unsigned)
 		append boneWgts1 (ReadShort fstream #unsigned)
 		append boneWgts2 (ReadShort fstream #unsigned)
-		
+
 		--if (boneIds2[boneIds2.count] > 0) do break()
 		--fseek fstream 6 #seek_cur --skip pad 6 bytes
 	)
@@ -1187,7 +1214,14 @@ fn ReadMesh fstream chunkEnd =
 				shadeIds = ReadLongArray fstream subChunkEnd
 			)
 			--0x00000023:	--W3D_CHUNK_PRELIT_UNLIT	// optional unlit material chunk wrapper
-			--0x00000024:	--W3D_CHUNK_PRELIT_VERTEX	// optional vertex-lit material chunk wrapper
+			-- // renegade part of the code
+			-- W3D_CHUNK_PRELIT_VERTEX (0x24) wraps the same MATERIAL_INFO/SHADERS/
+			-- VERTEX_MATERIALS/TEXTURES/MATERIAL_PASS chunks a non-prelit mesh has at
+			-- top level. Descend by NOT advancing past the wrapper -- the next loop
+			-- iteration reads the inner chunks. Without this, prelit meshes (Renegade
+			-- terrain in particular) fall through to the default arm and skip the
+			-- entire material block.
+			0x00000024: ()  -- W3D_CHUNK_PRELIT_VERTEX: descend (no-op; do not advance)
 			--0x00000025:	--W3D_CHUNK_PRELIT_LIGHTMAP_MULTI_PASS	// optional lightmapped multi-pass material chunk wrapper
 			--0x00000026:	--W3D_CHUNK_PRELIT_LIGHTMAP_MULTI_TEXTURE	// optional lightmapped multi-texture material chunk wrapper
 			0x00000028:	--W3D_CHUNK_MATERIAL_INFO	--materials information, pass count, etc (contains W3dMaterialInfoStruct)
@@ -1250,7 +1284,7 @@ fn ReadHLodObject fstream chunkEnd =
 (
 	pivotIndex = ReadLong fstream #unsigned
 	lodName = ReadString fstream
-	fseek fstream chunkEnd #seek_set -- skip object full name 32 bytes 
+	fseek fstream chunkEnd #seek_set -- skip object full name 32 bytes
 	result = HLodObject pivotIndex lodName
 )
 
@@ -1272,7 +1306,7 @@ fn ReadHLodObjectArray fstream chunkEnd=
 			(
 				lodObjs[lodObjs.count+1] = ReadHLodObject fstream subChunkEnd
 			)
-			
+
 			default:
 			(
 				fseek fstream chunkSize #seek_cur
@@ -1284,6 +1318,11 @@ fn ReadHLodObjectArray fstream chunkEnd=
 
 fn ReadHLod fstream chunkEnd =
 (
+	local header = undefined
+	local lodArray = undefined
+	local lodArrays = #()
+	local aggregates = #()  --renegade: HLodAggregate entries from 0x705
+	local proxies = #()     --renegade: pivot indices from 0x706
 	while (ftell fstream < chunkEnd) do
 	(
 		chunkType = ReadLong fstream #unsigned
@@ -1291,23 +1330,65 @@ fn ReadHLod fstream chunkEnd =
 		subChunkEnd = (ftell fstream) + chunkSize
 		case chunkType of
 		(
-			0x00000701:	--W3D_CHUNK_HLOD_HEADER	// general information such as name and version
+			0x00000701:	--W3D_CHUNK_HLOD_HEADER
 			(
 				header = ReadHLodHeader fstream
 			)
-			0x00000702:	--W3D_CHUNK_HLOD_LOD_ARRAY	// wrapper around the array of objects for each level of detail
+			0x00000702:	--W3D_CHUNK_HLOD_LOD_ARRAY
 			(
-				lodArray = ReadHLodObjectArray fstream subChunkEnd 
+				local arr = ReadHLodObjectArray fstream subChunkEnd
+				lodArrays[lodArrays.count + 1] = arr
+				if lodArrays.count == 1 do lodArray = arr  --keep lodArray == first for Generals compat
 			)
-			--0x00000705:	--W3D_CHUNK_HLOD_AGGREGATE_ARRAY	// array of aggregates, contains W3D_CHUNK_SUB_OBJECT_ARRAY_HEADER and W3D_CHUNK_SUB_OBJECT_ARRAY
-			--0x00000706:	--W3D_CHUNK_HLOD_PROXY_ARRAY	// array of proxies, used for application-defined purposes, provides a name and a bone.
+			0x00000705:	--W3D_CHUNK_HLOD_AGGREGATE_ARRAY  --renegade
+			(
+				while (ftell fstream < subChunkEnd) do
+				(
+					local subType = ReadLong fstream #unsigned
+					local subSize = GetChunkSize(ReadLong fstream #unsigned)
+					local subEnd  = (ftell fstream) + subSize
+					case subType of
+					(
+						0x00000703: ( fseek fstream subSize #seek_cur )  --array header, skip
+						0x00000704:  --SUB_OBJECT
+						(
+							local pivIdx = ReadLong fstream #unsigned
+							local aName  = ReadString fstream
+							fseek fstream subEnd #seek_set
+							aggregates[aggregates.count + 1] = HLodAggregate pivIdx aName
+						)
+						default: ( fseek fstream subSize #seek_cur )
+					)
+				)
+			)
+			0x00000706:	--W3D_CHUNK_HLOD_PROXY_ARRAY  --renegade
+			(
+				while (ftell fstream < subChunkEnd) do
+				(
+					local subType = ReadLong fstream #unsigned
+					local subSize = GetChunkSize(ReadLong fstream #unsigned)
+					local subEnd  = (ftell fstream) + subSize
+					case subType of
+					(
+						0x00000703: ( fseek fstream subSize #seek_cur )  --array header, skip
+						0x00000704:  --SUB_OBJECT
+						(
+							local pivIdx = ReadLong fstream #unsigned
+							local pName  = ReadString fstream
+							fseek fstream subEnd #seek_set
+							proxies[proxies.count + 1] = HLodAggregate pivIdx pName
+						)
+						default: ( fseek fstream subSize #seek_cur )
+					)
+				)
+			)
 			default:
 			(
 				fseek fstream chunkSize #seek_cur
 			)
 		)
 	)
-	result = HLod header lodArray
+	result = HLod header lodArray lodArrays aggregates proxies
 )
 
 fn ReadAABox fstream chunkEnd =
@@ -1326,7 +1407,7 @@ rollout rltDepStackController "Dependencies" width:200 height:120
 	dropDownList ddlMeshes "Meshes:" pos:[17,17] width:160 height:40
 	dropDownList ddlBones "Bones:" pos:[17,65] width:160 height:40
 	button btnSelectAllBones "Pick All Bones" pos:[33,120] width:127 height:36
-	
+
 	on ddlMeshes selected sel do
 	(
 		boneNames = #()
@@ -1336,7 +1417,7 @@ rollout rltDepStackController "Dependencies" width:200 height:120
 		select((depStacks[ddlMeshes.selection]).locMesh)
 		subobjectLevel = 1
 	)
-	
+
 	on ddlBones selected sel do
 	(
 		if wwBinding do
@@ -1344,10 +1425,10 @@ rollout rltDepStackController "Dependencies" width:200 height:120
 		if not wwBinding do
 		( select((depStacks[ddlMeshes.selection]).locMesh) )
 		subobjectLevel = 1
-		
+
 		(depStacks[ddlMeshes.selection]).locMesh.selectedVerts = (depStacks[ddlMeshes.selection]).Dependencies[ddlBones.selection].Vertices
 	)
-	
+
 	on btnSelectAllBones pressed do
 	(
 		clearSelection()
@@ -1361,11 +1442,29 @@ rollout rltDepStackController "Dependencies" width:200 height:120
 
 --interface
 --utility w3dimport "Coolfile W3D Importer"
-function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput useW3DMatl ignoreErrors fixNormals tga2dds fixVertices noMultiMat tga2ddsRev useWWSkin externalSkelFile importExtendedW3D pivotType =
+-- rnSelection: optional struct passed by the Renegade dialog for filtered imports.
+-- undefined = import everything (normal path). When set, only items whose names
+-- appear in the respective arrays are built. Empty array within the struct = import all of that category.
+struct RenegadeSelection
+(
+	meshes,       -- array of mesh names to import; empty = all
+	proxies,      -- array of proxy names to import; empty = all
+	aggregates,   -- array of aggregate names to import; empty = all
+	importAnim  = true,   -- false = skip animation keyframes
+	importBones = true,   -- false = skip hierarchy/bone creation
+	bonesOnly   = false,  -- true = skip mesh geometry, build bones only
+	lodMode     = -1,     -- -1 = All LODs, -2 = None, 0..N = single LOD index
+	animFrom    = -1,     -- -1 = no clamp (import all frames), else 0-based first frame
+	animTo      = -1,     -- -1 = no clamp,                      else 0-based last  frame
+	depBonesOnly = false, -- true + non-empty .meshes -> keep only bones referenced by selected meshes' hierarchies (incl. parent ancestors)
+	originBone   = false  -- true -> add a single Bone at world origin and reparent root pivots under it
+)
+
+function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput useW3DMatl ignoreErrors fixNormals tga2dds fixVertices noMultiMat tga2ddsRev useWWSkin externalSkelFile importExtendedW3D rnSelection:undefined =
 (
 	-- Bump this when editing the script so you can confirm Max is running the expected copy.
 	-- Bump alongside any non-trivial logic change so the debug log makes the loaded version obvious.
-	local importerVersion = "v17"
+	local importerVersion = "v20"
 	if debugOutput do
 	(
 		format "=================================================\n"
@@ -1388,16 +1487,16 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 	global meshes = #()
 	global hlodSet = undefined
 	global pickbox = undefined
-	
+
 	global gmPivots = #()
 	global gmMeshes = #()
-	
+
 	global depStacks = #()
 	global wwBinding = true
-	
+
 	global maxBinding = false
 	global wwBinding = false
-	
+
 	-- Binding type (if any)
 	-- When ckbUseWWSkin (Advanced tab) is checked, override the radio-button
 	-- choice and force the 2023 WWSkin path, which constructs the WSM via the
@@ -1442,24 +1541,29 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 			)
 		)
 	)
-	
+
 	fn GetHLodObject searchName =
 	(
-		for i = 1 to hlodSet.lodArray.lodObjects.count do
-		( if searchName == hlodSet.lodArray.lodObjects[i].lodName do return hlodSet.lodArray.lodObjects[i] )
+		--renegade: search across all LOD arrays (Generals models have only one, so no perf impact)
+		for a = 1 to hlodSet.lodArrays.count do
+		(
+			local arr = hlodSet.lodArrays[a]
+			for i = 1 to arr.lodObjects.count do
+			( if searchName == arr.lodObjects[i].lodName do return arr.lodObjects[i] )
+		)
 		result = undefined
 	)
-	
-	if not batch do
+
+	if not batch and w3dfilename == undefined do
 	( w3dfilename = getOpenFileName caption:"W3D Import Dialogue" types:"Westwood 3D (*.w3d)|*.w3d|All Files (*.*)|*.*|" )
-	
+
 	if w3dfilename != undefined then
 	(
-		fstream = fopen w3dfilename "rb"  ---binary 
+		fstream = fopen w3dfilename "rb"  ---binary
 		fseek fstream 0 #seek_end
 		filesize = ftell fstream
 		fseek fstream 0 #seek_set
-		
+
 		while (ftell fstream < filesize) do -- or (CounterAux < 100)) do
 		(
 			chunkType = ReadLong fstream #unsigned
@@ -1471,27 +1575,27 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 			------ debug end ------
 			chunkSize = GetChunkSize(ReadLong fstream #unsigned)
 			chunkEnd = (ftell fstream) + chunkSize
-			
+
 			------ debug start ------
 			--chunkSize = ReadLong fstream
 			--chunkSize = GetChunkSize(chunkSize)
 			--print (bit.intAsHex chunkSize)
 			------ debug end ------
-			
+
 			case chunkType of
 			(
 				0x00000000:	--W3D_CHUNK_MESH	-- mesh definition
 				( meshes[meshes.count+1] = ReadMesh fstream chunkEnd )
-				
+
 				0x00000100:	--W3D_CHUNK_HIERARCHY	-- hierarchy tree definition
 				( hier = ReadHierarchy fstream chunkEnd )
-				
+
 				0x00000200:	--W3D_CHUNK_ANIMATION	-- hierarchy animation data
 				( anim = ReadAnimation fstream chunkEnd )
-				
+
 				0x00000280:	--W3D_CHUNK_COMPRESSED_ANIMATION	// compressed hierarchy animation data
 				( cmpAnim = ReadCompressedAnimation fstream chunkEnd )
-				
+
 				--0x000002C0:	--W3D_CHUNK_MORPH_ANIMATION	// hierarchy morphing animation data (morphs between poses, for facial animation)
 				--0x00000300:	--W3D_CHUNK_HMODEL	// blueprint for a hierarchy model
 				--0x00000400:	--W3D_CHUNK_LODMODEL	// blueprint for an LOD model
@@ -1500,20 +1604,37 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 				--0x00000460:	--W3D_CHUNK_LIGHT	// description of a light
 				--0x00000500:	--W3D_CHUNK_EMITTER	// description of a particle emitter
 				--0x00000600:	--W3D_CHUNK_AGGREGATE	// description of an aggregate object
-				
+
 				0x00000700:	--W3D_CHUNK_HLOD	// description of an HLod object (see HLodClass)
-				( hlodSet = ReadHLod fstream chunkEnd )
-				
+				(
+					if debugOutput do format "=== HLOD chunk found ===\n"
+					hlodSet = ReadHLod fstream chunkEnd
+					if debugOutput do
+					(
+						format "  lodArrays: %  aggregates: %  proxies: %\n" \
+							hlodSet.lodArrays.count \
+							(if hlodSet.aggregates != undefined then hlodSet.aggregates.count else 0) \
+							(if hlodSet.proxies != undefined then hlodSet.proxies.count else 0)
+						for a = 1 to hlodSet.lodArrays.count do
+						(
+							local arr = hlodSet.lodArrays[a]
+							format "  HLOD_LOD_ARRAY[%]: % sub-object(s)\n" a arr.lodObjects.count
+							for o = 1 to arr.lodObjects.count do
+								format "    [%] % -> pivot %\n" o arr.lodObjects[o].lodName arr.lodObjects[o].pivotIndex
+						)
+					)
+				)
+
 				0x00000740:	--W3D_CHUNK_BOX	// defines an collision box render object (W3dBoxStruct)
 				( pickbox = ReadAABox fstream chunkEnd )
-				
+
 				--0x00000741:	--W3D_CHUNK_SPHERE
 				--0x00000742:	--W3D_CHUNK_RING
 				--0x00000750:	--W3D_CHUNK_NULL_OBJECT	// defines a NULL object (W3dNullObjectStruct)
 				--0x00000800:	--W3D_CHUNK_LIGHTSCAPE	// wrapper for lights created with Lightscape.
 				--0x00000900:	--W3D_CHUNK_DAZZLE	// wrapper for a glare object.  Creates halos and flare lines seen around a bright light source
 				--0x00000A00:	--W3D_CHUNK_SOUNDROBJ	// description of a sound render object
-				
+
 				default:
 				( fseek fstream chunkSize #seek_cur )
 			)
@@ -1557,7 +1678,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 		-- skeleton + keyframes, so check anim/cmpAnim too.
 		if (batch and meshes.count == 0 and anim == undefined and cmpAnim == undefined) do
 		( return() )
-		
+
 		-- Resolve the skeleton source. Three cases, in priority order:
 		--   1. user-picked external skeleton (Use External Skeleton checkbox) — always wins
 		--   2. main w3d already had a hierarchy chunk → keep it as-is
@@ -1635,55 +1756,157 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 		--print meshes
 		--print hlodSet
 		------ debug end ------
-		
-		-- create pivots(bones)
-		if hier != undefined then
-		(
-			-- pivotType: 1 = Max Bone (default original importer), 2 = Sphere
-			-- (V1.16-style green geom -- visually distinctive but exporter
-			-- treats it as render geometry, beware), 3 = Point Helper (tiny
-			-- helper marker; max2w3d.dle's IsW3DBoneNode picks it up via
-			-- HELPER_CLASS_ID so Select Bones / W3D export classify it as a
-			-- bone instead of geometry). Default to Bone if undefined for
-			-- back-compat with any external callers.
-			local _pt = pivotType
-			if _pt == undefined do _pt = 1
-			local pivotBoxColor = (color 0 255 0)
 
-			-- Auto-size pivot markers from the imported meshes' bbox so they
-			-- stay readable across infantry / vehicles / structures without a
-			-- per-import scale knob. Bones aren't affected -- Max sizes those
-			-- automatically from parent-to-child distance.
-			-- Done by walking raw vertex data (meshes[].verts is already
-			-- populated; mesh nodes don't exist yet).
-			local pivotBoxSize = 0.075   -- fallback for empty / no-vert files
-			local pointMarkerSize = 0.15 -- ditto
-			if meshes.count > 0 do
+		-- create pivots(bones)
+		local _rnImportBones = not (rnSelection != undefined and rnSelection.importBones == false)
+		local _rnBonesOnly   = (rnSelection != undefined and rnSelection.bonesOnly == true)
+		local _rnImportAnim  = not (rnSelection != undefined and rnSelection.importAnim == false)
+		-- LOD filter: -1 = all (default), -2 = none, 0..N = specific LOD index in hlodSet.lodArrays
+		local _rnLodMode = if rnSelection != undefined then rnSelection.lodMode else -1
+		-- Animation range: -1/-1 = no clamp (import all frames in file)
+		local _rnAnimFrom = if rnSelection != undefined then rnSelection.animFrom else -1
+		local _rnAnimTo   = if rnSelection != undefined then rnSelection.animTo   else -1
+		if debugOutput do
+		(
+			local _lodN = if hlodSet != undefined and hlodSet.lodArrays != undefined then hlodSet.lodArrays.count else 0
+			local _lodPick = if _rnLodMode == -1 then "All" \
+				else if _rnLodMode == -2 then "None" \
+				else (_rnLodMode as string)
+			format "=== LOD selection ===\n"
+			format "  LODs in file : % (indices 0..%)\n" _lodN (if _lodN > 0 then _lodN - 1 else -1)
+			format "  Chosen LOD   : %\n" _lodPick
+			local _animPick = if _rnAnimFrom < 0 or _rnAnimTo < 0 then "All" else (((_rnAnimFrom as string) + ".." + (_rnAnimTo as string)))
+			format "  Anim range   : %\n" _animPick
+		)
+		fn _rnMeshInLod meshFullName lodMode hlodSet =
+		(
+			if lodMode == -1 do return true
+			if lodMode == -2 do return false
+			if hlodSet == undefined or hlodSet.lodArrays == undefined do return true
+			local idx = lodMode + 1
+			if idx < 1 or idx > hlodSet.lodArrays.count do return false
+			local arr = hlodSet.lodArrays[idx]
+			for o = 1 to arr.lodObjects.count do
+				if arr.lodObjects[o].lodName == meshFullName do return true
+			false
+		)
+
+		-- "Bones in Selection's Hierarchy Only" (ckbDepBones): when the user
+		-- imported a subset of meshes via "Import Selected", optionally prune
+		-- the bone hierarchy to just the pivots those meshes reference (incl.
+		-- their parent ancestors up to root). Build the keep-set up front so
+		-- the bone-creation loop can skip everything else.
+		--
+		-- Walk: for each kept mesh, collect unique boneIds from vertInfs and
+		-- the mesh's own boneIndex (rigid skinning), then climb parentID
+		-- chains to root, marking every ancestor as kept.
+		--
+		-- gmPivots is built in lockstep with hier.pivots[2..N]; skipped slots
+		-- get `undefined` so indices remain valid for vertInfs lookups (the
+		-- existing guards already treat undefined as "not present").
+		local _depBones = (rnSelection != undefined and rnSelection.depBonesOnly == true \
+			and rnSelection.meshes != undefined and rnSelection.meshes.count > 0)
+		local _keepBone = #{}   -- bitset of pivot IDs (0-based) to create
+		if _depBones and hier != undefined do
+		(
+			-- Always keep root (ID 0) since it's not represented in gmPivots.
+			-- Mark IDs 1..pivots.count-1; will close under parent ancestry.
+			for mi = 1 to meshes.count do
 			(
-				local minX = 1e30; local minY = 1e30; local minZ = 1e30
-				local maxX = -1e30; local maxY = -1e30; local maxZ = -1e30
-				for mi = 1 to meshes.count do
+				local _mfn = meshes[mi].header.containerName + "." + meshes[mi].header.meshName
+				if findItem rnSelection.meshes _mfn == 0 do continue
+				if meshes[mi].vertInfs != undefined then
 				(
-					if meshes[mi].verts == undefined do continue
-					for v in meshes[mi].verts do
+					for v = 1 to meshes[mi].vertInfs.boneIds1.count do
 					(
-						if v.x < minX do minX = v.x
-						if v.y < minY do minY = v.y
-						if v.z < minZ do minZ = v.z
-						if v.x > maxX do maxX = v.x
-						if v.y > maxY do maxY = v.y
-						if v.z > maxZ do maxZ = v.z
+						local b = meshes[mi].vertInfs.boneIds1[v]
+						if b > 0 and b < hier.pivots.count do _keepBone[b] = true
+					)
+					for v = 1 to meshes[mi].vertInfs.boneIds2.count do
+					(
+						local b = meshes[mi].vertInfs.boneIds2[v]
+						if b > 0 and b < hier.pivots.count do _keepBone[b] = true
 					)
 				)
-				if maxX > minX do
+				-- Rigid mesh: header.boneIndex points to the pivot the mesh
+				-- attaches to (no per-vert influences). Keep that pivot too.
+				if meshes[mi].header != undefined and \
+					(isProperty meshes[mi].header #boneIndex) and \
+					meshes[mi].header.boneIndex > 0 and \
+					meshes[mi].header.boneIndex < hier.pivots.count do
+					_keepBone[meshes[mi].header.boneIndex] = true
+			)
+			-- Close under parent ancestry: a kept bone's parents must be kept
+			-- too, otherwise the scene-graph parenting breaks.
+			local changed = true
+			while changed do
+			(
+				changed = false
+				for b in _keepBone do
 				(
-					local diag = length (Point3 (maxX - minX) (maxY - minY) (maxZ - minZ))
-					-- ~1% of the bbox diagonal: 1.8u infantry -> ~0.02-0.03,
-					-- which is too small visually, so clamp to a useful floor.
-					-- Use 2% for spheres, 4% for point helpers (point markers
-					-- read smaller per-unit because they're line drawings).
-					pivotBoxSize    = amax #(diag * 0.02, 0.5)
-					pointMarkerSize = amax #(diag * 0.04, 1.0)
+					local pid = hier.pivots[b + 1].parentID
+					if pid > 0 and pid < hier.pivots.count and not _keepBone[pid] do
+					(
+						_keepBone[pid] = true
+						changed = true
+					)
+				)
+			)
+		)
+
+		if hier != undefined and _rnImportBones then
+		(
+			-- Bone visuals come from the active W3DPreferences profile.
+			-- Shape codes (UI label -> INI value -> scene node):
+			--   1 = "Bone"          -> "box"      -> Max Bone (only choice that
+			--                                          works with Auto-Bind > max skin)
+			--   2 = "Geometry"      -> "sphere"   -> sphere primitive
+			--   3 = "Point Helper"  -> "cylinder" -> point helper (recognised as a
+			--                                          W3D bone by max2w3d.dle's
+			--                                          IsW3DBoneNode via HELPER_CLASS_ID)
+			-- INI vocabulary kept as box/sphere/cylinder for cross-compat with 1.16b's
+			-- W3D-Importer.ini files.
+			-- BoneSize: literal size; 0 = auto-fit from imported bbox.
+			-- BoneColor: wirecolor.
+			local _pt = W3DImporterInit.getActive "BoneShape"
+			if _pt == undefined do _pt = 1
+			local _bsize  = W3DImporterInit.getActive "BoneSize"
+			if _bsize == undefined do _bsize = 0
+			local _bcolor = W3DImporterInit.getActive "BoneColor"
+			if _bcolor == undefined do _bcolor = (color 0 255 0)
+			local pivotBoxColor = _bcolor
+
+			-- Size 0 = auto-fit from imported meshes' bbox.
+			-- Bones (shape 1) ignore this (Max sizes them from parent-to-child distance).
+			local pivotBoxSize    = _bsize
+			local pointMarkerSize = _bsize
+			if _bsize == 0 then
+			(
+				pivotBoxSize    = 0.075   -- fallback for empty / no-vert files
+				pointMarkerSize = 0.15
+				if meshes.count > 0 do
+				(
+					local minX = 1e30; local minY = 1e30; local minZ = 1e30
+					local maxX = -1e30; local maxY = -1e30; local maxZ = -1e30
+					for mi = 1 to meshes.count do
+					(
+						if meshes[mi].verts == undefined do continue
+						for v in meshes[mi].verts do
+						(
+							if v.x < minX do minX = v.x
+							if v.y < minY do minY = v.y
+							if v.z < minZ do minZ = v.z
+							if v.x > maxX do maxX = v.x
+							if v.y > maxY do maxY = v.y
+							if v.z > maxZ do maxZ = v.z
+						)
+					)
+					if maxX > minX do
+					(
+						local diag = length (Point3 (maxX - minX) (maxY - minY) (maxZ - minZ))
+						pivotBoxSize    = amax #(diag * 0.02, 0.5)
+						pointMarkerSize = amax #(diag * 0.04, 1.0)
+					)
 				)
 			)
 
@@ -1698,6 +1921,14 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 				for i = 2 to hier.pivots.count do
 				(
 					curPivot = undefined
+					-- DepBones gate: hier.pivots[i] has 0-based ID (i-1). If a
+					-- pivot isn't in the keep-set, append undefined to gmPivots
+					-- to keep indices aligned with pivot IDs and skip creation.
+					if _depBones and not _keepBone[i - 1] do
+					(
+						append gmPivots undefined
+						continue
+					)
 					case _pt of
 					(
 						2: -- Sphere (V1.16 reference look)
@@ -1760,22 +1991,95 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 					append gmPivots curPivot
 				)
 			)
+
+			-- "Create Origin Bone" (ckbOriginBone): one Max Bone at world origin
+			-- that becomes the parent of every existing root pivot. Useful as a
+			-- single transform handle for the whole rig (move/rotate the origin
+			-- to translate the model). Not added to gmPivots so vertInfs / anim
+			-- channel indices stay aligned with hier.pivots.
+			--
+			-- Always a real Max Bone regardless of profile shape; the maxBinding
+			-- second pass (line ~3478) only converts class==Bone, and the origin
+			-- isn't referenced by skin weights, so this is purely a transform
+			-- parent.
+			--
+			-- Sized from the profile's BoneSize (literal). When BoneSize is 0
+			-- (auto-fit), reuse the bbox-derived pivotBoxSize. Either way, scale
+			-- up by 4x: the origin is a "parent the rig" handle, so being
+			-- visually distinct from child bones helps users grab it.
+			if rnSelection != undefined and rnSelection.originBone == true do
+			(
+				-- Bone length is set by the start->end distance arg of
+				-- createBone, NOT by width/height. Earlier version used
+				-- [0,0,0]->[1,0,0] which baked in a 1-unit length regardless
+				-- of profile size. Now: length = scaled profile size, width
+				-- and height are proportional so the bone box stays tidy.
+				local _osz = if _bsize > 0 then _bsize else pivotBoxSize
+				_osz *= 4.0
+				if _osz <= 0 do _osz = 1.0
+				local _origin = boneSys.createBone [0,0,0] [_osz,0,0] [0,0,1]
+				_origin.name = "Origin"
+				-- BoneGeometry width/height live on the underlying object, not
+				-- the node. Setting `_origin.width` directly silently no-ops
+				-- (or shadows to a node-level prop that doesn't render).
+				_origin.baseObject.width  = _osz * 0.25
+				_origin.baseObject.height = _osz * 0.25
+				_origin.wirecolor = (color 255 255 0)
+				for p in gmPivots do
+				(
+					if p == undefined do continue
+					if p.parent == undefined do p.parent = _origin
+				)
+			)
 		)
-		
-		-- create meshes
+
+		-- // renegade part of the code
+		-- Per-import material cache, keyed by composite (vmName + texFile + blendMode).
+		-- Decoupled from sceneMaterials/mat.name on purpose: mat.name stays set to vmName
+		-- so re-export through max2w3d.dle preserves the original W3D vertex-material
+		-- name (composite mat.names leaked into the .w3d output and broke the in-game
+		-- model). findItem on a parallel-array hash works on every Max version with no
+		-- dotNet dependency.
+		local _matCacheKeys = #()
+		local _matCacheVals = #()
+
+		-- ESC interrupt: user can press ESC to abort the build between meshes.
+		-- Partial work is kept in the scene; user can manually clean up.
+		local _rnAborted = false
+
+		-- create meshes (skipped entirely when bonesOnly is set)
 		for i = 1 to meshes.count do
 		(
+			if keyboard.escPressed do
+			(
+				format "*** Import aborted by user (ESC) at mesh %/% ***\n" i meshes.count
+				_rnAborted = true
+				exit
+			)
+			if _rnBonesOnly do continue
+
+			local _rnMeshFullName = meshes[i].header.containerName + "." + meshes[i].header.meshName
+
+			-- renegade selection filter: skip meshes not in the selected list
+			if rnSelection != undefined and rnSelection.meshes.count > 0 do
+			(
+				if findItem rnSelection.meshes _rnMeshFullName == 0 do continue
+			)
+
+			-- renegade LOD filter: skip meshes not in the selected LOD level
+			if not (_rnMeshInLod _rnMeshFullName _rnLodMode hlodSet) do continue
+
 			gmVerts = meshes[i].verts
 			gmFaces = #()
 			for f = 1 to meshes[i].faces.count do
 				gmFaces[f] = meshes[i].faces[f].vertIds + 1 -- gMax array lower-limit is 1 while w3d's is 0
-	
+
 			-- create a mesh
 			gmMeshes[i] = mesh name:meshes[i].header.meshName vertices:gmVerts faces:gmFaces
 			-- Set by the No Multi-Mat splitter when it replaces gmMeshes[i] with a split node;
 			-- guards the post-material UV/normal loops that assume the original mesh size.
 			local noMultiMatHandled = false
-			
+
 			-- create a new material or apply an exist one and
 			if (meshes[i].vertMatls != undefined) and (meshes[i].vertMatls.count > 0) then
 			(
@@ -3066,7 +3370,21 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 					gmMatl = undefined
 					matlName = meshes[i].vertMatls[1].vmName
 
-					if userSeparateMaterial or (sceneMaterials[matlName] == undefined) then
+					-- // renegade part of the code
+					-- Decouple cache key from display name. mat.name stays = vmName so
+					-- re-export preserves the original W3D vertex-material label
+					-- (max2w3d.dle writes mat.name straight into the output .w3d).
+					-- Lookup key composes vmName + stage-0 texFile + blendMode so
+					-- distinct (texture, blend) tuples that share a vmName don't collide
+					-- in the cache. Renegade assets reuse vmNames like "silo_top",
+					-- "Material #28" across meshes pointing at different textures.
+					local _matCacheTex = ""
+					if (meshes[i].textures != undefined) and (meshes[i].textures.count > 0) and (meshes[i].textures[1] != undefined) and (meshes[i].textures[1].txFileName != undefined) do
+						_matCacheTex = meshes[i].textures[1].txFileName
+					local _matCacheKey = matlName + "|" + _matCacheTex + "|bm" + (meshBlendMode as string)
+					local _matCacheHit = findItem _matCacheKeys _matCacheKey
+
+					if userSeparateMaterial or (_matCacheHit == 0) then
 					(
 						-- Try W3D Tools material first when requested
 						if useW3DMatl do
@@ -3080,6 +3398,9 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 						if gmMatl != undefined then
 						(
 							append sceneMaterials gmMatl
+							-- // renegade part of the code
+							append _matCacheKeys _matCacheKey
+							append _matCacheVals gmMatl
 						)
 						else
 						(
@@ -3125,16 +3446,20 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 							)
 						)
 						append sceneMaterials gmMatl
+						-- // renegade part of the code
+						append _matCacheKeys _matCacheKey
+						append _matCacheVals gmMatl
 						)  -- end inner else (standardMaterial fallback)
 					)
 					else
 					(
-						gmMatl = sceneMaterials[matlName]
+						-- // renegade part of the code: cache hit by composite key
+						gmMatl = _matCacheVals[_matCacheHit]
 					)
 					gmMeshes[i].material = gmMatl
 				)
 			)
-			
+
 			-- map a texture at v1.02
 			-- Skip when No Multi-Mat already replaced gmMeshes[i] with a split node:
 			-- the split path already set up its own per-bucket UVs/normals, and the
@@ -3190,7 +3515,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 								gmMeshes[i].pos = gmPivots[p].pos
 								for c = gmPivots[p].children.count to 1 by -1 do
 								(													   --only want to rearrange the hierarchy
-									if(gmPivots[p].children[c] != undefined) then 
+									if(gmPivots[p].children[c] != undefined) then
 									( gmPivots[p].children[c].parent = gmMeshes[i] )   --not the pivot positions of the children
 								)
 								disusedPivot = gmPivots[p]
@@ -3207,38 +3532,38 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 					)
 				)
 			)
-			
+
 			-- fix the influenced verts in infantry skin at v1.03
 			if (meshes[i].vertInfs != undefined) and (hier != undefined) then
 			(
 				for v = 1 to meshes[i].vertInfs.boneIds1.count do
 				(
 					p = meshes[i].vertInfs.boneIds1[v]
-					-- please enable these 2 lines when unexpected error happen here 
+					-- please enable these 2 lines when unexpected error happen here
 					if p <= 0 do continue
 					if gmPivots[p] == undefined do continue
 					in coordsys gmPivots[p] setVert gmMeshes[i] v meshes[i].verts[v]
 				)
-				
+
 				--to show influenced info at v1.08
 				--format "%: \n" meshes[i].header.meshName - obsolete, replaced with the 'Auto-Bind' option
-				
+
 				if (autoBindType > 0) do
 				( currDeps = #() )
-				
+
 				for p = 1 to hier.pivots.count do
 				(
 					ivs = #()
 					for v = 1 to (meshes[i].vertInfs.boneIds1.count - 1) do
 					( if meshes[i].vertInfs.boneIds1[v] == (p - 1) do (append ivs v) )
-					
+
 					if splitMeshes do
 					(
 						if (ivs.count > 1) do
 						(
 							hide gmMeshes[i]
 							tmpChunk = meshop.detachVerts gmMeshes[i] ivs delete:false asMesh:true
-							
+
 							newChunk = Editable_Mesh()
 							newChunk.mesh = tmpChunk
 							newChunk.name = hier.pivots[p].pivotName
@@ -3247,7 +3572,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 						)
 						update
 					)
-					
+
 					if (autoBindType > 0) do
 					(
 						if (ivs.count > 1) do
@@ -3263,7 +3588,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 					)
 					--(format "% %: %\n" p hier.pivots[p].pivotName ivs)
 				)
-				
+
 				if (autoBindType > 0) do
 				(
 					currDepStack = DependencyStack gmMeshes[i] currDeps
@@ -3271,10 +3596,20 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 				)
 			)
 		)
-		
+
 		--somehow when inserting max bones directly to the code generating gmPivots some parts of meshes start flipping around.
 		--can't be bothered to look for the reason why, so helper bones are replaced with max ones here.
-		
+
+		-- Bone-fins display toggle (v19): read once from the rollout if present.
+		-- Defaults to true so behaviour matches v18 when the checkbox is absent
+		-- (rollout bypassed for batch/programmatic calls).
+		local showBoneFins = true
+		try
+		(
+			if isProperty rltMain #ckbShowBoneFins do showBoneFins = rltMain.ckbShowBoneFins.checked
+		)
+		catch()
+
 		if maxBinding do
 		(
 			for i=1 to gmPivots.count do
@@ -3283,33 +3618,52 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 				maxPivot = boneSys.createBone [0,0,0] [0,0,0] [0,0,1]
 				maxPivot.width = 0.5
 				maxPivot.height = 0.5
-				
+
 				maxPivot.name = gmPivots[i].name
 				maxPivot.transform = gmPivots[i].transform
-				maxPivot.showLinks = true
-				
+				if isProperty maxPivot #showLinks do maxPivot.showLinks = showBoneFins
+				if isProperty maxPivot #showFins  do maxPivot.showFins  = showBoneFins
+				if (not showBoneFins) do
+				(
+					if isProperty maxPivot #frontFinSize do maxPivot.frontFinSize = 0
+					if isProperty maxPivot #backFinSize  do maxPivot.backFinSize  = 0
+					if isProperty maxPivot #sideFinSize  do maxPivot.sideFinSize  = 0
+				)
+
 				if (hier.pivots[i+1].parentID != 0) do
 				( maxPivot.parent = gmPivots[hier.pivots[i+1].parentID] )
-				
+
 				obsltPivot = gmPivots[i]
 				gmPivots[i] = maxPivot
 				delete obsltPivot
 			)
 		)
-		
-		if (anim != undefined) and (hier != undefined) then
+
+		if (anim != undefined) and (hier != undefined) and _rnImportAnim then
 		(
+			-- Honor user-chosen animation range (from Renegade dialog spinners).
+			-- Frame indices in W3D are 0-based; Max's animationRange is 1-based,
+			-- so we add 1. -1 means "no clamp".
+			local _rangeStart = if _rnAnimFrom >= 0 then (_rnAnimFrom + 1) else 1
+			local _rangeEnd   = if _rnAnimTo   >= 0 then (_rnAnimTo   + 1) else anim.header.frameCount
+			if _rangeEnd <= _rangeStart do _rangeEnd = _rangeStart + 1
 			if anim.header.frameCount > 1 then
-				animationRange = interval 1 anim.header.frameCount -- edited at v1.07
+				animationRange = interval _rangeStart _rangeEnd
 			else
 				animationRange = interval 0 1
 			frameRate = anim.header.frameRate
-			
+
 			for i = 1 to anim.channels.count do
 			(
+				if keyboard.escPressed do
+				(
+					format "*** Import aborted by user (ESC) at anim channel %/% ***\n" i anim.channels.count
+					_rnAborted = true
+					exit
+				)
 				curChn = anim.channels[i]
 				--curObj = execute ("$'" + hier.pivots[curChn.pivotID + 1].pivotName + "'") -- at v1.02. it should be curChn.pivotID + 1 at v1.04
-				
+
 				try
 				( curObj = gmPivots[curChn.pivotID] ) -- test at v1.04
 				catch
@@ -3472,7 +3826,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 					)
 				)
 			)
-			
+
 			for i = 1 to anim.bitchannels.count do
 			(
 				curChn = anim.bitchannels[i]
@@ -3548,7 +3902,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 				)
 			) --for end
 		) --if end
-		
+
 		/*for i=1 to cmpAnim.channels.count do
 		(
 			if cmpAnim.channels[i].type == 2 then
@@ -3556,19 +3910,29 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 			else
 				format "%;%;%\n" cmpAnim.channels[i].pivotID cmpAnim.channels[i].timeCodesCount gmPivots[cmpAnim.channels[i].pivotID].name
 		)*/
-		
-		if (cmpAnim != undefined) and (hier != undefined) then
+
+		if (cmpAnim != undefined) and (hier != undefined) and _rnImportAnim then
 		(
 			if cmpAnim.header.frameCount < 1 do cmpAnim.header.frameCount = 1
-			animationRange = interval 1 cmpAnim.header.frameCount -- edited at v1.07
+			-- Honor user-chosen animation range (Renegade dialog spinners).
+			local _rangeStart = if _rnAnimFrom >= 0 then (_rnAnimFrom + 1) else 1
+			local _rangeEnd   = if _rnAnimTo   >= 0 then (_rnAnimTo   + 1) else cmpAnim.header.frameCount
+			if _rangeEnd <= _rangeStart do _rangeEnd = _rangeStart + 1
+			animationRange = interval _rangeStart _rangeEnd
 			frameRate = cmpAnim.header.frameRate
-			
+
 			case cmpAnim.header.flavour of
 			(
 				0x0: --ANIM_FLAVOUR_TIMECODED
 				(
 					for i = 1 to cmpAnim.channels.count do
 					(
+						if keyboard.escPressed do
+						(
+							format "*** Import aborted by user (ESC) at compressed-timecoded channel %/% ***\n" i cmpAnim.channels.count
+							_rnAborted = true
+							exit
+						)
 						curChn = cmpAnim.channels[i]
 						try
 						( curObj = gmPivots[curChn.pivotID] ) -- test at v1.04
@@ -3578,14 +3942,14 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 						(
 							datumPos = hier.pivots[curChn.pivotID + 1].pos
 							datumRot = hier.pivots[curChn.pivotID + 1].rotation
-							
+
 							-- added in 1.12, handles channels with a single value
 							if curChn.values.count == 1 do
 							(
 								curChn.values[curChn.values.count+1] = AnimationTimeCodedKey cmpAnim.header.frameCount curChn.values[curChn.values.count].keyValue
 								curChn.timeCodesCount += 1
 							)
-							
+
 							case curChn.flags of
 							(
 								0x0000: --ANIM_CHANNEL_TIMECODED_X = 0
@@ -3599,7 +3963,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 										(
 											fCurr = curChn.values[t].keyTime
 											vCurr = curChn.values[t].keyValue
-											
+
 											if t > 1 then
 											(
 												fPrev = curChn.values[t-1].keyTime + 1
@@ -3610,7 +3974,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 												fPrev = fCurr
 												vPrev = vCurr
 											)
-											
+
 											if (fCurr >= 0) and (fPrev >= 0) then
 											(
 												for f = fPrev to fCurr do
@@ -3624,7 +3988,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 													)
 													else
 													( curKey = curObj.pos.controller.keys[k] )
-													
+
 													step = vPrev + ((vCurr - vPrev) * (f - fPrev + 1) / (fCurr - fPrev + 1))
 													curKey.value += [step, 0, 0] * (inverse datumRot)
 												)
@@ -3645,10 +4009,10 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 											curKey.value += [curChn.initDelta,0,0] * (inverse datumRot)
 										)
 										prevKey = curKey
-										
+
 										byteIdx = 1
 										bitIdx = 1
-										
+
 										--print ("-----" + (cmpAnim.channels[i].pivotID As String) + "-----")
 										--print ("Type:" + (cmpAnim.channels[i].flags As String))
 										--print ("Frames:" + (cmpAnim.channels[i].framesCount As String))
@@ -3657,7 +4021,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 										--( print cmpAnim.channels[i].values[b] )
 										for t = 2 to cmpAnim.channels[i].values.count do
 										(
-											
+
 											for bitIdx = 1 to 8 do
 											(
 												curVal = bit.get (curChn.values[byteIdx]) bitIdx
@@ -3737,7 +4101,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 											curKey = curObj.pos.controller.keys[k]
 											curKey.value += [0,curChn.initDelta,0] * (inverse datumRot)
 										)
-										
+
 										--print ("-----" + (cmpAnim.channels[i].pivotID As String) + "-----")
 										--print ("Type:" + (cmpAnim.channels[i].flags As String))
 										--print ("Frames:" + (cmpAnim.channels[i].framesCount As String))
@@ -3798,7 +4162,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 											curKey = curObj.pos.controller.keys[k]
 											curKey.value += [0,0,curChn.initDelta] * (inverse datumRot)
 										)
-										
+
 										--print ("-----" + (cmpAnim.channels[i].pivotID As String) + "-----")
 										--print ("Type:" + (cmpAnim.channels[i].flags As String))
 										--print ("Frames:" + (cmpAnim.channels[i].framesCount As String))
@@ -3817,7 +4181,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 											f = curChn.values[t].keyTime
 											curKey = addNewKey curObj.rotation.controller (f + 1)
 											curKey.value = curChn.values[t].keyValue - (inverse datumRot)
-											
+
 											/*prvKey = getKey curObj.rotation.controller (curObj.rotation.controller.keys.count - 1)
 											if (prvKey.time < curKey.time - 1) do
 											(
@@ -3825,12 +4189,12 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 												(
 													prvCoef = ((curKey.time - q) as Integer)/((curKey.time - prvKey.time) as Integer)
 													curCoef = ((q - prvKey.time) as Integer)/((curKey.time - prvKey.time) as Integer)
-													
+
 													x = curCoef*curKey.value.x + prvCoef*prvKey.value.x
 													y = curCoef*curKey.value.y + prvCoef*prvKey.value.y
 													z = curCoef*curKey.value.z + prvCoef*prvKey.value.z
 													w = curCoef*curKey.value.w + prvCoef*prvKey.value.w
-													
+
 													newKey = addNewKey curObj.rotation.controller q
 													newKey.value = Quat x y z w
 												)
@@ -3841,7 +4205,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 									(
 										curKey = addNewKey curObj.rotation.controller 1
 										curKey.value = datumRot + curChn.initDelta
-										
+
 										--print ("-----" + (cmpAnim.channels[i].pivotID As String) + "-----")
 										--print ("Type:" + (cmpAnim.channels[i].flags As String))
 										--print ("Frames:" + (cmpAnim.channels[i].framesCount As String))
@@ -3887,7 +4251,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 					--					if bitIdx > 8 then
 					--					(
 					--						byteIdx += 1
-					--						bitIdx = 1							
+					--						bitIdx = 1
 					--					)
 					--				)
 					--			)
@@ -3901,7 +4265,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 				--0x2: --ANIM_FLAVOUR_VALID
 			)
 		) --if end
-					
+
 		if wwBinding do
 		(
 			for m = 1 to meshes.count do
@@ -3911,13 +4275,13 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 					--convertTo gmMeshes[m] Editable_Poly
 					--convertTo gmMeshes[m] Editable_Mesh
 					bindSpaceWarp gmMeshes[m] wwSkin
-					
+
 					for p = 1 to gmPivots.count do
 					(
 						if gmPivots[p] != undefined do
 							wwAddBone gmPivots[p] gmMeshes[m]
 					)
-					
+
 					for v = 1 to (meshes[m].vertInfs.boneIds1.count) do
 					(
 						--print v
@@ -3926,7 +4290,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 						--print meshes[m].vertInfs.boneIds2[v]
 						--print meshes[m].vertInfs.boneWgts2[v]
 						--print "---------------"
-						
+
 						-- Bone-index guards: vertInfs reference into gmPivots, but if the
 						-- skeleton came from a different file (Use External Skeleton) or
 						-- the model contains bone indices past the loaded pivot count,
@@ -3950,7 +4314,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 				)
 			)
 		)
-			
+
 		if maxBinding do
 		(
 			for m = 1 to meshes.count do
@@ -3960,16 +4324,16 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 					local currSkin = skin()
 					addModifier gmMeshes[m] currSkin
 					currSkin.bone_Limit = 2
-					
+
 					setCommandPanelTaskMode #modify
 					modPanel.setCurrentObject currSkin ui:true
-					
+
 					for p = 1 to gmPivots.count do
 					( skinOps.addBone currSkin gmPivots[p] 0 ) --0 for no redrawing
-					
+
 					max modify mode
 					redrawViews()
-					
+
 					for v = 1 to (meshes[m].vertInfs.boneIds1.count) do
 					(
 						if (meshes[m].vertInfs.boneIds1[v] > 0) do
@@ -3977,9 +4341,9 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 							skinOps.unNormalizeVertex currSkin v false
 							skinOps.selectBone currSkin meshes[m].vertInfs.boneIds1[v]
 							skinOps.replaceVertexWeights currSkin v meshes[m].vertInfs.boneIds1[v] 1
-							skinOps.setVertexWeights currSkin v meshes[m].vertInfs.boneIds1[v] 1							
+							skinOps.setVertexWeights currSkin v meshes[m].vertInfs.boneIds1[v] 1
 						)
-						
+
 						if (meshes[m].vertInfs.boneIds2[v] > 0) and (meshes[m].vertInfs.boneWgts1[v] < 100) do
 						(
 							skinOps.selectBone currSkin meshes[m].vertInfs.boneIds2[v]
@@ -3989,7 +4353,7 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 				)
 			)
 		)
-		
+
 		-- ---- deferred Fix Vertices / Fix Normals ----
 		-- Run after wwBinding / maxBinding so that Skin or W3DSkin (which were applied to
 		-- gmMeshes[m] during the binding pass) see the original topology when they bind,
@@ -4164,9 +4528,9 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 			sName = pickbox.boxName
 			dotPos = findString sName "."
 			if (dotPos != undefined) and (dotPos < sName.count) do (sName = subString sName (dotPos + 1) -1)
-			gmBox = Box name:sName pos:pickbox.centre 
-			gmBox.width = pickbox.extent.x 
-			gmBox.length = pickbox.extent.y 
+			gmBox = Box name:sName pos:pickbox.centre
+			gmBox.width = pickbox.extent.x
+			gmBox.length = pickbox.extent.y
 			gmBox.height = pickbox.extent.z
 			gmBox.wirecolor = pickbox.boxColor
 
@@ -4190,57 +4554,1467 @@ function cfW3DImporter w3dfilename splitMeshes autoBindType batch debugOutput us
 				)
 			)
 		)
-		
-		if batch do
+
+		-- ---- renegade: aggregate and proxy bones ----
+		-- Aggregates (0x705): referenced sub-objects that aren't imported as geometry;
+		-- represented as hidden point helpers parented to the declared bone.
+		-- Proxies (0x706): application-defined markers; represented as visible point helpers.
+		if hlodSet != undefined and hier != undefined then
 		(
-			saveMaxFile(substring w3dfilename 1 (w3dfilename.count-4))
+			if hlodSet.aggregates != undefined and hlodSet.aggregates.count > 0 do
+			(
+				if debugOutput do format "=== HLOD Aggregates: % entries ===\n" hlodSet.aggregates.count
+				local _aShape = W3DImporterInit.getActive "AggregateShape"
+				local _aSize  = W3DImporterInit.getActive "AggregateSize"
+				local _aColor = W3DImporterInit.getActive "AggregateColor"
+				if _aShape == undefined do _aShape = 1
+				if _aSize  == undefined or _aSize == 0 do _aSize = 1.0
+				if _aColor == undefined do _aColor = (color 255 128 0)
+				for i = 1 to hlodSet.aggregates.count do
+				(
+					local agg = hlodSet.aggregates[i]
+					local dotPos = findString agg.name "."
+					local shortName = if dotPos != undefined then (subString agg.name (dotPos + 1) -1) else agg.name
+					-- renegade selection filter
+					if rnSelection != undefined and rnSelection.aggregates.count > 0 do
+						if findItem rnSelection.aggregates shortName == 0 do continue
+					local aggNode = W3DImporterInit.makeShape _aShape shortName _aSize _aColor
+					hide aggNode
+					try ( wwSetExportGeoFlag aggNode true ) catch ()
+					try ( wwSetExportBoneFlag aggNode false ) catch ()
+					try ( wwSetType aggNode 8 ) catch ()
+					if agg.pivotIndex > 0 and agg.pivotIndex <= gmPivots.count and gmPivots[agg.pivotIndex] != undefined then
+						aggNode.parent = gmPivots[agg.pivotIndex]
+					if debugOutput do format "  aggregate [%] -> pivot %\n" shortName agg.pivotIndex
+				)
+			)
+			if hlodSet.proxies != undefined and hlodSet.proxies.count > 0 do
+			(
+				if debugOutput do format "=== HLOD Proxies: % entries ===\n" hlodSet.proxies.count
+				local _pShape = W3DImporterInit.getActive "ProxyShape"
+				local _pSize  = W3DImporterInit.getActive "ProxySize"
+				local _pColor = W3DImporterInit.getActive "ProxyColor"
+				if _pShape == undefined do _pShape = 1
+				if _pSize  == undefined or _pSize == 0 do _pSize = 1.0
+				if _pColor == undefined do _pColor = (color 0 200 255)
+				for i = 1 to hlodSet.proxies.count do
+				(
+					local prx = hlodSet.proxies[i]
+					local dotPos = findString prx.name "."
+					local shortName = if dotPos != undefined then (subString prx.name (dotPos + 1) -1) else prx.name
+					-- renegade selection filter
+					if rnSelection != undefined and rnSelection.proxies.count > 0 do
+						if findItem rnSelection.proxies shortName == 0 do continue
+					local prxNode = W3DImporterInit.makeShape _pShape shortName _pSize _pColor
+					try ( wwSetExportGeoFlag prxNode true ) catch ()
+					try ( wwSetExportBoneFlag prxNode true ) catch ()
+					if prx.pivotIndex > 0 and prx.pivotIndex <= gmPivots.count and gmPivots[prx.pivotIndex] != undefined then
+						prxNode.parent = gmPivots[prx.pivotIndex]
+					if debugOutput do format "  proxy [%] -> pivot %\n" shortName prx.pivotIndex
+				)
+			)
+		)
+		-- ---- end renegade aggregate/proxy ----
+
+		-- Pure animation (v19): when checked, bake an FBX next to the source .w3d
+		-- (works in both batch and single-file mode). Wrapped in try() because
+		-- FBXEXP requires the FBX plugin to be loaded; failure is non-fatal.
+		local pureAnimationMode = false
+		try
+		(
+			if isProperty rltMain #ckbPureAnim do pureAnimationMode = rltMain.ckbPureAnim.checked
+		)
+		catch()
+
+		local baseName = substring w3dfilename 1 (w3dfilename.count-4)
+
+		if pureAnimationMode do
+		(
+			try
+			(
+				local fbxPath = baseName + ".fbx"
+				format "Pure animation: exporting FBX to: %\n" fbxPath
+				exportFile fbxPath #noPrompt selectedOnly:false using:FBXEXP
+			)
+			catch
+			(
+				format "Pure animation: FBX export failed (%)\n" (getCurrentException())
+			)
+		)
+
+		if batch and not _rnAborted do
+		(
+			saveMaxFile baseName
 			resetMaxFile #noPrompt
 		)
+
+		if _rnAborted do
+			format "*** Import incomplete -- partial scene left for manual cleanup ***\n"
+	)
+)
+
+-- ---------------------------------------------------------------------------
+-- Renegade Import dialog  (mirrors 1.16b W3DImportDlg layout)
+-- Parses a picked .w3d using existing script-scope readers, shows all lists,
+-- then calls cfW3DImporter with an optional RenegadeSelection filter.
+-- ---------------------------------------------------------------------------
+rollout rltRenegade "W3D Importer - Advanced" width:718 height:575 silentErrors:false
+(
+	-- parsed data kept at rollout scope so import handlers can read it
+	local rnFilename   = undefined
+	local rnParsedHier = undefined
+	local rnParsedHlod = undefined
+	local rnMeshNames  = #()   -- "CONTAINER.MESH" strings from HLOD sub-objects
+	local rnBoneNames  = #()   -- pivot names
+	local rnAggNames   = #()   -- aggregate short names
+	local rnProxNames  = #()   -- proxy short names
+	local rnAnimFrames = 0     -- frame count from anim header (0 = no animation)
+	local rnAnimRate   = 0     -- fps from anim header
+
+	-- ---- Import Options outer box ----
+	groupBox grpOptions "Import Options:" pos:[4,5] width:710 height:431
+
+	-- Meshes
+	groupBox grpMeshSel "Meshes Selection:" pos:[13,25] width:226 height:261
+	multiListBox mlbMeshes "" pos:[22,43] width:208 height:15
+	button btnMeshAll    "All"    pos:[23,254]  width:64
+	button btnMeshInvert "Invert" pos:[94,254]  width:64
+	button btnMeshClear  "Clear"  pos:[165,254] width:64
+
+	-- Proxies
+	groupBox grpProxSel "Proxies Selection:" pos:[246,25] width:226 height:261
+	multiListBox mlbProxies "" pos:[255,43] width:208 height:15
+	button btnProxAll    "All"    pos:[256,254] width:64
+	button btnProxInvert "Invert" pos:[327,254] width:64
+	button btnProxClear  "Clear"  pos:[398,254] width:64
+
+	-- Aggregates
+	groupBox grpAggSel "Aggregates Selection:" pos:[479,25] width:226 height:192
+	multiListBox mlbAgg "" pos:[488,43] width:208 height:10
+	button btnAggAll    "All"    pos:[489,187] width:64
+	button btnAggInvert "Invert" pos:[560,187] width:64
+	button btnAggClear  "Clear"  pos:[631,187] width:64
+
+	-- Dazzles (display only — dazzles not imported by cfW3DImporter)
+	groupBox grpDazzSel "Dazzles Selection:" pos:[479,227] width:226 height:200
+	multiListBox mlbDazzles "" pos:[488,246] width:208 height:10
+	button btnDazzAll    "All"    pos:[489,395] width:64
+	button btnDazzInvert "Invert" pos:[560,395] width:64
+	button btnDazzClear  "Clear"  pos:[631,395] width:64
+
+	-- Animation: dropdown gates the From/To spinners.
+	-- Items + spinner range are populated from the file's actual frame count
+	-- in populateDialog(). Disabled when ckbImportAnim is unchecked.
+	groupBox grpAnim "Animation:" pos:[13,296] width:226 height:61
+	checkbox ckbImportAnim "Import Animation Frames" pos:[23,314] checked:true
+	dropDownList ddlAnimRange "" pos:[23,335] width:96 items:#("All Frames", "Custom Range")
+	spinner spnAnimFrom "F:" type:#integer pos:[131,338] fieldwidth:32 range:[0,99999,0]
+	spinner spnAnimTo   "T:" type:#integer pos:[183,338] fieldwidth:32 range:[0,99999,0]
+
+	-- LOD: dropdown is populated in populateDialog() based on actual LOD count.
+	-- Items: "All", "0".."N-1" (capped to lodArrays.count), "None".
+	groupBox grpLod "Level Of Details:" pos:[13,367] width:226 height:60
+	dropDownList ddlLod "Import:" pos:[23,384] width:206 height:40 items:#("All")
+
+	-- Bones
+	groupBox grpBones "Bones:" pos:[246,296] width:226 height:131
+	checkbox ckbImportBones    "Import Bones"                         pos:[256,314] checked:true
+	checkbox ckbDepBones       "Bones in Selection's Hierarchy Only"  pos:[256,333] checked:false enabled:false \
+		tooltip:"Only meaningful with 'Import Selected'. When checked, only bones referenced by the selected meshes (and their parent ancestors) are created. Bones unrelated to the selection are skipped."
+	checkbox ckbOriginBone     "Create Origin Bone"                   pos:[256,352] checked:false \
+		tooltip:"Add a single Max Bone at world origin and reparent the imported root pivots under it. Useful as a single transform handle for the whole rig."
+	checkbox ckbLodBones       "Create A Set Of Bones For Each LOD"   pos:[256,371] checked:false enabled:false \
+		tooltip:"Not implemented. W3D files share one hierarchy across all LODs by design, so per-LOD bone duplication doesn't round-trip through the exporter."
+	button   btnBonesOnly      "Import Bones Only" pos:[281,395] width:156
+
+	-- W3D File Properties
+	groupBox grpProps "W3D File Properties:" pos:[4,446] width:590 height:126
+
+	label lblNameL     "Name :"       pos:[23,465]
+	label lblNameV     "N/A"          pos:[65,465]  width:200 align:#left
+	label lblTypeL     "Type :"       pos:[27,485]
+	label lblTypeV     "N/A"          pos:[65,485]  width:200 align:#left
+	label lblLodL      "LOD :"        pos:[29,505]
+	label lblLodV      "N/A"          pos:[65,505]  width:37  align:#left
+	label lblMeshL     "Meshes :"     pos:[14,525]
+	label lblMeshV     "N/A"          pos:[65,525]  width:37  align:#left
+	label lblFramesL   "Frames :"     pos:[17,545]
+	label lblFramesV   "N/A"          pos:[65,545]  width:37  align:#left
+	label lblBonesL    "Bones :"      pos:[155,505]
+	label lblBonesV    "N/A"          pos:[200,505] width:37  align:#left
+	label lblAggL      "Aggregates :" pos:[131,525]
+	label lblAggV      "N/A"          pos:[200,525] width:37  align:#left
+	label lblFrameRtL  "Frame Rate :" pos:[130,545]
+	label lblFrameRtV  "N/A"          pos:[200,545] width:37  align:#left
+	label lblProxL     "Proxies :"    pos:[287,505]
+	label lblProxV     "N/A"          pos:[336,505] width:37  align:#left
+	label lblDazzL     "Dazzles :"    pos:[284,525]
+	label lblDazzV     "N/A"          pos:[336,525] width:37  align:#left
+	label lblBoxesL    "Boxes :"      pos:[292,545]
+	label lblBoxesV    "N/A"          pos:[336,545] width:37  align:#left
+
+	-- Bones list
+	groupBox grpBoneList "Bones List:" pos:[401,465] width:184 height:98
+	listBox lbBonesList "" pos:[410,483] width:168 height:5
+
+	-- Right-side action buttons
+	button btnImportSel "Import Selected" pos:[610,472] width:100
+	button btnImport    "Import"          pos:[610,501] width:100
+	button btnCancel    "Cancel"          pos:[610,530] width:100
+
+	-- ---- helpers ----
+	-- Toggles enabled-state of the animation range controls based on the master
+	-- "Import Animation Frames" checkbox and the Range dropdown.
+	-- Defined before populateDialog so the forward call resolves.
+	fn updateAnimEnabled =
+	(
+		local masterOn = ckbImportAnim.enabled and ckbImportAnim.checked
+		ddlAnimRange.enabled = masterOn
+		local custom = masterOn and (ddlAnimRange.selection == 2)
+		spnAnimFrom.enabled = custom
+		spnAnimTo.enabled   = custom
+	)
+
+	fn populateDialog =
+	(
+		-- properties
+		local modelName = if rnFilename != undefined then getFilenameFile rnFilename else "N/A"
+		local modelType = "N/A"
+		if rnParsedHlod != undefined and rnParsedHlod.header != undefined do
+		(
+			modelName = rnParsedHlod.header.hlodName as string
+			modelType = "HLOD"
+		)
+		if rnParsedHier != undefined and rnParsedHier.header != undefined do
+		(
+			if modelType == "N/A" do modelName = rnParsedHier.header.hierName as string
+			modelType = if rnParsedHlod != undefined then "HLOD + Hierarchy" else "Hierarchy"
+		)
+		lblNameV.caption = modelName
+		lblTypeV.caption = modelType
+
+		local lodCnt  = if rnParsedHlod != undefined then rnParsedHlod.lodArrays.count else 0
+		local aggCnt  = rnAggNames.count
+		local proxCnt = rnProxNames.count
+		local boneCnt = rnBoneNames.count
+
+		lblLodV.caption    = lodCnt          as string
+		lblMeshV.caption   = rnMeshNames.count as string
+		lblBonesV.caption  = boneCnt         as string
+		lblAggV.caption    = aggCnt          as string
+		lblProxV.caption   = proxCnt         as string
+		lblDazzV.caption   = "0"
+		lblBoxesV.caption  = "0"
+		lblFramesV.caption  = if rnAnimFrames > 0 then (rnAnimFrames as string) else "N/A"
+		lblFrameRtV.caption = if rnAnimRate   > 0 then (rnAnimRate   as string) else "N/A"
+
+		mlbMeshes.items   = rnMeshNames
+		mlbProxies.items  = rnProxNames
+		mlbAgg.items      = rnAggNames
+		mlbDazzles.items  = #()
+		lbBonesList.items = rnBoneNames
+
+		-- LOD dropdown: "All", one entry per LOD index (capped to lodArrays.count), "None"
+		local lodItems = #("All")
+		for i = 0 to (lodCnt - 1) do append lodItems (i as string)
+		append lodItems "None"
+		ddlLod.items     = lodItems
+		ddlLod.selection = 1   -- default: All
+		ddlLod.enabled   = (lodCnt > 0)
+
+		-- Animation: pre-fill spinners with the file's actual frame range.
+		-- frame indices in W3D animations are 0-based; "All" means [0..frameCount-1].
+		local maxFrame = if rnAnimFrames > 0 then (rnAnimFrames - 1) else 0
+		spnAnimFrom.range = [0, maxFrame, 0]
+		spnAnimTo.range   = [0, maxFrame, maxFrame]
+		spnAnimFrom.value = 0
+		spnAnimTo.value   = maxFrame
+		ckbImportAnim.enabled = (rnAnimFrames > 0)
+		if not ckbImportAnim.enabled do ckbImportAnim.checked = false
+		ddlAnimRange.selection = 1
+		updateAnimEnabled()
+
+		btnImport.enabled    = (rnFilename != undefined)
+		btnImportSel.enabled = false
+	)
+
+	fn getSelectedItems mlb =
+	(
+		local sel = #()
+		for i = 1 to mlb.items.count do
+			if mlb.selection[i] do append sel mlb.items[i]
+		sel
+	)
+
+	fn doImport selOnly =
+	(
+		if rnFilename == undefined do return undefined
+		-- capture everything into true locals before destroying the dialog,
+		-- since destroying the rollout clears rollout-scope variables
+		local importFile = rnFilename
+		local doAnim     = ckbImportAnim.checked
+		local doBones    = ckbImportBones.checked
+		-- LOD dropdown: index 1 = "All" (-1), last = "None" (-2), middle = LOD index (0-based)
+		local lodSel = ddlLod.selection
+		local lodN   = ddlLod.items.count
+		local lodMd  = if lodSel == 1 then -1 else if lodSel == lodN then -2 else (lodSel - 2)
+		-- Animation range: -1/-1 = all frames; otherwise honor user-chosen [from..to]
+		local aFrom = -1
+		local aTo   = -1
+		if doAnim and ddlAnimRange.selection == 2 do
+		(
+			aFrom = spnAnimFrom.value
+			aTo   = spnAnimTo.value
+		)
+		-- DepBones only takes effect with selOnly + a non-empty meshes list
+		-- (computeBones gates on rnSelection.meshes.count > 0). The flag is
+		-- still passed through for "Import All" so the importer's behaviour
+		-- is fully described by the selection struct, but it'll no-op there.
+		local depB   = ckbDepBones.checked
+		local origB  = ckbOriginBone.checked
+		local sel = if selOnly then
+		(
+			local sm = getSelectedItems mlbMeshes
+			local sp = getSelectedItems mlbProxies
+			local sa = getSelectedItems mlbAgg
+			RenegadeSelection meshes:sm proxies:sp aggregates:sa importAnim:doAnim importBones:doBones bonesOnly:false lodMode:lodMd animFrom:aFrom animTo:aTo depBonesOnly:depB originBone:origB
+		)
+		else
+		(
+			RenegadeSelection meshes:#() proxies:#() aggregates:#() importAnim:doAnim importBones:doBones bonesOnly:false lodMode:lodMd animFrom:aFrom animTo:aTo depBonesOnly:depB originBone:origB
+		)
+
+		-- snapshot settings from rltMain Advanced tab BEFORE destroying any dialog,
+		-- so the import path uses the same options the regular Import button would.
+		-- Wrap in try/catch per-control so a missing/renamed control falls back safely.
+		local dbg    = try ( rltMain.ckbDebugOutput.checked )       catch ( false )
+		local w3dmat = try ( rltMain.ckbUseW3DMatl.checked )        catch ( false )
+		local extW3D = try ( rltMain.ckbImportExtendedW3D.checked ) catch ( false )
+		local fxN    = try ( rltMain.ckbFixNormals.checked )        catch ( false )
+		local fxV    = try ( rltMain.ckbFixVertices.checked )       catch ( false )
+		local t2d    = try ( rltMain.ckbTga2Dds.checked )           catch ( false )
+		local t2dr   = try ( rltMain.ckbTga2DdsRev.checked )        catch ( false )
+		local nmm    = try ( rltMain.ckbNoMultiMat.checked )        catch ( false )
+		local wwsk   = try ( rltMain.ckbUseWWSkin.checked )         catch ( false )
+		local splt   = try ( rltMain.ckbSplitDependencies.checked ) catch ( false )
+		local autoB  = try ( rltMain.rbgAutoBind.state )            catch ( 0 )
+		local ignE   = try ( not rltMain.ckbIgnoreErrors.checked )  catch ( true )
+		local extSkel = try ( if rltMain.ckbUseExternalSkel.checked then externalSkeletonFile else undefined ) catch ( undefined )
+
+		try ( destroyDialog rltRenegade ) catch ()
+
+		cfW3DImporter importFile splt autoB false dbg w3dmat ignE fxN t2d fxV nmm t2dr wwsk extSkel extW3D rnSelection:sel
+	)
+
+	-- DepBones only makes sense when there's a non-empty mesh subset selected
+	-- (it walks selected meshes' vertInfs to compute the keep-set). Mirrors
+	-- the meshes-multi-listbox state across every site that mutates it.
+	fn _refreshDepEnabled =
+	(
+		ckbDepBones.enabled = (getSelectedItems mlbMeshes).count > 0
+		if not ckbDepBones.enabled do ckbDepBones.checked = false
+	)
+
+	-- ---- list button handlers ----
+	on btnMeshAll    pressed do ( mlbMeshes.selection  = #{1..mlbMeshes.items.count};   btnImportSel.enabled = true; _refreshDepEnabled() )
+	on btnMeshClear  pressed do ( mlbMeshes.selection  = #{};                           btnImportSel.enabled = (getSelectedItems mlbMeshes).count > 0 or (getSelectedItems mlbProxies).count > 0 or (getSelectedItems mlbAgg).count > 0; _refreshDepEnabled() )
+	on btnMeshInvert pressed do
+	(
+		local inv = #{}
+		for i = 1 to mlbMeshes.items.count do if not mlbMeshes.selection[i] do inv[i] = true
+		mlbMeshes.selection = inv
+		btnImportSel.enabled = (getSelectedItems mlbMeshes).count > 0 or (getSelectedItems mlbProxies).count > 0 or (getSelectedItems mlbAgg).count > 0
+		_refreshDepEnabled()
+	)
+
+	on btnProxAll    pressed do ( mlbProxies.selection = #{1..mlbProxies.items.count};  btnImportSel.enabled = true )
+	on btnProxClear  pressed do ( mlbProxies.selection = #{};                           btnImportSel.enabled = (getSelectedItems mlbMeshes).count > 0 or (getSelectedItems mlbProxies).count > 0 or (getSelectedItems mlbAgg).count > 0 )
+	on btnProxInvert pressed do
+	(
+		local inv = #{}
+		for i = 1 to mlbProxies.items.count do if not mlbProxies.selection[i] do inv[i] = true
+		mlbProxies.selection = inv
+		btnImportSel.enabled = (getSelectedItems mlbMeshes).count > 0 or (getSelectedItems mlbProxies).count > 0 or (getSelectedItems mlbAgg).count > 0
+	)
+
+	on btnAggAll    pressed do ( mlbAgg.selection = #{1..mlbAgg.items.count};            btnImportSel.enabled = true )
+	on btnAggClear  pressed do ( mlbAgg.selection = #{};                                 btnImportSel.enabled = (getSelectedItems mlbMeshes).count > 0 or (getSelectedItems mlbProxies).count > 0 or (getSelectedItems mlbAgg).count > 0 )
+	on btnAggInvert pressed do
+	(
+		local inv = #{}
+		for i = 1 to mlbAgg.items.count do if not mlbAgg.selection[i] do inv[i] = true
+		mlbAgg.selection = inv
+		btnImportSel.enabled = (getSelectedItems mlbMeshes).count > 0 or (getSelectedItems mlbProxies).count > 0 or (getSelectedItems mlbAgg).count > 0
+	)
+
+	on btnDazzAll    pressed do mlbDazzles.selection = #{1..mlbDazzles.items.count}
+	on btnDazzClear  pressed do mlbDazzles.selection = #{}
+	on btnDazzInvert pressed do
+	(
+		local inv = #{}
+		for i = 1 to mlbDazzles.items.count do if not mlbDazzles.selection[i] do inv[i] = true
+		mlbDazzles.selection = inv
+	)
+
+	-- enable Import Selected whenever any list selection changes
+	on mlbMeshes   selected i do ( btnImportSel.enabled = (getSelectedItems mlbMeshes).count > 0 or (getSelectedItems mlbProxies).count > 0 or (getSelectedItems mlbAgg).count > 0; _refreshDepEnabled() )
+	on mlbProxies  selected i do btnImportSel.enabled = (getSelectedItems mlbMeshes).count > 0 or (getSelectedItems mlbProxies).count > 0 or (getSelectedItems mlbAgg).count > 0
+	on mlbAgg      selected i do btnImportSel.enabled = (getSelectedItems mlbMeshes).count > 0 or (getSelectedItems mlbProxies).count > 0 or (getSelectedItems mlbAgg).count > 0
+
+	on btnBonesOnly pressed do
+	(
+		local importFile = rnFilename
+		local doAnim     = ckbImportAnim.checked
+		local dbg    = try ( rltMain.ckbDebugOutput.checked )       catch ( false )
+		local w3dmat = try ( rltMain.ckbUseW3DMatl.checked )        catch ( false )
+		local extW3D = try ( rltMain.ckbImportExtendedW3D.checked ) catch ( false )
+		local fxN    = try ( rltMain.ckbFixNormals.checked )        catch ( false )
+		local fxV    = try ( rltMain.ckbFixVertices.checked )       catch ( false )
+		local t2d    = try ( rltMain.ckbTga2Dds.checked )           catch ( false )
+		local t2dr   = try ( rltMain.ckbTga2DdsRev.checked )        catch ( false )
+		local nmm    = try ( rltMain.ckbNoMultiMat.checked )        catch ( false )
+		local wwsk   = try ( rltMain.ckbUseWWSkin.checked )         catch ( false )
+		local splt   = try ( rltMain.ckbSplitDependencies.checked ) catch ( false )
+		local autoB  = try ( rltMain.rbgAutoBind.state )            catch ( 0 )
+		local ignE   = try ( not rltMain.ckbIgnoreErrors.checked )  catch ( true )
+		local extSkel = try ( if rltMain.ckbUseExternalSkel.checked then externalSkeletonFile else undefined ) catch ( undefined )
+		try ( destroyDialog rltRenegade ) catch ()
+		local bSel   = RenegadeSelection meshes:#() proxies:#() aggregates:#() importAnim:doAnim importBones:true bonesOnly:true lodMode:-1 animFrom:-1 animTo:-1 depBonesOnly:false originBone:ckbOriginBone.checked
+		cfW3DImporter importFile splt autoB false dbg w3dmat ignE fxN t2d fxV nmm t2dr wwsk extSkel extW3D rnSelection:bSel
+	)
+
+	on btnImport    pressed do doImport false
+	on btnImportSel pressed do doImport true
+	on btnCancel    pressed do ( try ( destroyDialog rltRenegade ) catch () )
+
+	-- Animation control wiring
+	on ckbImportAnim changed v do updateAnimEnabled()
+	on ddlAnimRange  selected i do updateAnimEnabled()
+	-- Keep From <= To when the user edits either spinner
+	on spnAnimFrom changed v do ( if spnAnimTo.value < v do spnAnimTo.value = v )
+	on spnAnimTo   changed v do ( if spnAnimFrom.value > v do spnAnimFrom.value = v )
+
+	on rltRenegade open do
+	(
+		-- pick up the filename passed via global from btnRenegade.
+		-- Use ::rnPendingFile to force global-scope access; otherwise MAXScript
+		-- treats the bare name as a rollout-local and reads undefined.
+		local _pf = ::rnPendingFile
+		rnFilename = if _pf != undefined then _pf else undefined
+		::rnPendingFile = undefined
+		if rnFilename == undefined do
+		(
+			try ( destroyDialog rltRenegade ) catch ()
+			return undefined
+		)
+
+		-- parse the file using existing script-scope readers
+		local fs = fopen rnFilename "rb"
+		if fs == undefined do
+		(
+			messageBox ("Could not open: " + rnFilename) title:"Renegade Inspector"
+			try ( destroyDialog rltRenegade ) catch ()
+			return undefined
+		)
+
+		fseek fs 0 #seek_end
+		local fsize = ftell fs
+		fseek fs 0 #seek_set
+
+		rnParsedHier = undefined
+		rnParsedHlod = undefined
+		rnMeshNames  = #()
+		rnBoneNames  = #()
+		rnAggNames   = #()
+		rnProxNames  = #()
+		rnAnimFrames = 0
+		rnAnimRate   = 0
+
+		while (ftell fs < fsize) do
+		(
+			local cType = ReadLong fs #unsigned
+			local cSize = GetChunkSize(ReadLong fs #unsigned)
+			local cEnd  = (ftell fs) + cSize
+			case cType of
+			(
+				0x00000100: ( rnParsedHier = ReadHierarchy fs cEnd )
+				0x00000000:
+				(
+					local mhdr = undefined
+					while (ftell fs < cEnd) and (mhdr == undefined) do
+					(
+						local scType = ReadLong fs #unsigned
+						local scSize = GetChunkSize(ReadLong fs #unsigned)
+						local scEnd  = (ftell fs) + scSize
+						if scType == 0x0000001F then mhdr = ReadMeshHeader fs
+						fseek fs scEnd #seek_set
+					)
+					if mhdr != undefined do
+						append rnMeshNames (mhdr.containerName + "." + mhdr.meshName)
+					fseek fs cEnd #seek_set
+				)
+				0x00000700: ( rnParsedHlod = ReadHLod fs cEnd )
+				0x00000200: -- W3D_CHUNK_ANIMATION
+				(
+					-- only read the header sub-chunk (0x201), skip the rest
+					while (ftell fs < cEnd) do
+					(
+						local scType = ReadLong fs #unsigned
+						local scSize = GetChunkSize(ReadLong fs #unsigned)
+						local scEnd  = (ftell fs) + scSize
+						if scType == 0x00000201 then
+						(
+							local ah = ReadAnimationHeader fs
+							rnAnimFrames = ah.frameCount
+							rnAnimRate   = ah.frameRate
+						)
+						fseek fs scEnd #seek_set
+					)
+				)
+				0x00000280: -- W3D_CHUNK_COMPRESSED_ANIMATION
+				(
+					while (ftell fs < cEnd) do
+					(
+						local scType = ReadLong fs #unsigned
+						local scSize = GetChunkSize(ReadLong fs #unsigned)
+						local scEnd  = (ftell fs) + scSize
+						if scType == 0x00000281 then
+						(
+							local ah = ReadCompressedAnimationHeader fs
+							rnAnimFrames = ah.frameCount
+							rnAnimRate   = ah.frameRate
+						)
+						fseek fs scEnd #seek_set
+					)
+				)
+				default:    ( fseek fs cSize #seek_cur )
+			)
+		)
+		fclose fs
+
+		-- build name lists from parsed data
+		if rnParsedHlod != undefined then
+		(
+			rnMeshNames = #()
+			for a = 1 to rnParsedHlod.lodArrays.count do
+			(
+				local arr = rnParsedHlod.lodArrays[a]
+				for o = 1 to arr.lodObjects.count do
+					append rnMeshNames arr.lodObjects[o].lodName
+			)
+			if rnParsedHlod.aggregates != undefined do
+				for i = 1 to rnParsedHlod.aggregates.count do
+				(
+					local dotPos = findString rnParsedHlod.aggregates[i].name "."
+					append rnAggNames (if dotPos != undefined then subString rnParsedHlod.aggregates[i].name (dotPos+1) -1 else rnParsedHlod.aggregates[i].name)
+				)
+			if rnParsedHlod.proxies != undefined do
+				for i = 1 to rnParsedHlod.proxies.count do
+				(
+					local dotPos = findString rnParsedHlod.proxies[i].name "."
+					append rnProxNames (if dotPos != undefined then subString rnParsedHlod.proxies[i].name (dotPos+1) -1 else rnParsedHlod.proxies[i].name)
+				)
+		)
+		if rnParsedHier != undefined and rnParsedHier.pivots != undefined do
+			for i = 1 to rnParsedHier.pivots.count do
+				append rnBoneNames (rnParsedHier.pivots[i].pivotName as string)
+
+		populateDialog()
+	)
+)
+
+-- ============================================================================
+-- W3D Importer Preferences (ported from w3d-importer-1.16b.ms, importer-only)
+-- Profile-based pivot/proxy/aggregate/dazzle visualisation settings, persisted
+-- to (getDir #userScripts)\W3D-Importer.ini. Open via Edit > Preferences on
+-- the importer dialog's menu bar.
+--
+-- Differences from 1.16b's prefs:
+--   - No "CreateMeshesBones" (export-side concern, not the importer)
+--   - No "Always use one profile" / Char / Vehicle profile assignment
+--     (export-side; v20 is import-only)
+--   - INI lives in user-scripts dir, not next to the script
+--   - BoneSize/ProxySize/AggregateSize/DazzleSize: 0 = auto-fit from bbox
+-- ============================================================================
+
+struct W3D_Importer_Init
+(
+	ImporterInitFile = (getDir #userScripts) + "\\W3D-Importer.ini",
+	Initialized = false,
+	CurrentProfile,
+	W3DPaths = #(),
+	ProfilesList = #(),
+	-- Per-profile values, packed: 12 fields per profile.
+	-- index = (12 * (profile - 1)) + fieldOffset, fieldOffsets:
+	--   1=BoneShape 2=BoneSize 3=BoneColor
+	--   4=ProxyShape 5=ProxySize 6=ProxyColor
+	--   7=AggregateShape 8=AggregateSize 9=AggregateColor
+	--  10=DazzleShape 11=DazzleSize 12=DazzleColor
+	-- Shape codes: 1=Box 2=Sphere 3=Cylinder
+	UserProfiles = #(),
+	ProfilesDefaults = #(),
+
+	fn ColorToString val =
+	(
+		val = val as color
+		((val.r as integer) as string) + "," + ((val.g as integer) as string) + "," + ((val.b as integer) as string)
+	),
+
+	fn valToShape val =
+	(
+		case val of
+		(
+			1: "box"
+			2: "sphere"
+			3: "cylinder"
+			default: "box"
+		)
+	),
+
+	fn fieldOffset name =
+	(
+		case name of
+		(
+			"BoneShape": 1
+			"BoneSize": 2
+			"BoneColor": 3
+			"ProxyShape": 4
+			"ProxySize": 5
+			"ProxyColor": 6
+			"AggregateShape": 7
+			"AggregateSize": 8
+			"AggregateColor": 9
+			"DazzleShape": 10
+			"DazzleSize": 11
+			"DazzleColor": 12
+			default: 0
+		)
+	),
+
+	fn getProfileValue profile fieldName =
+	(
+		if profile == undefined or profile < 1 or profile > ProfilesList.count do return undefined
+		local fOff = fieldOffset fieldName
+		if fOff == 0 do return undefined
+		UserProfiles[(12 * (profile - 1)) + fOff]
+	),
+
+	-- Convenience: read a field from the active profile.
+	fn getActive fieldName =
+	(
+		if not Initialized do init()
+		getProfileValue CurrentProfile fieldName
+	),
+
+	-- Default values for the three baseline profiles, mirroring 1.16b's
+	-- ProfilesDefaults but stripped of CreateMeshesBones (export-side).
+	fn getProfileDefaults profile fieldName:"all" =
+	(
+		if profile < 1 or profile > 3 do profile = 1
+		local index = (12 * (profile - 1)) + 1
+		if fieldName == "all" then
+		(
+			local out = #()
+			for i = 0 to 11 do append out ProfilesDefaults[index + i]
+			return out
+		)
+		local fOff = fieldOffset fieldName
+		if fOff == 0 do return undefined
+		ProfilesDefaults[index + fOff - 1]
+	),
+
+	-- Build a scene node for the given shape code. Used by the importer for
+	-- proxies and aggregates so the user's profile choice takes effect.
+	-- Shape: 1=Box (point helper box), 2=Sphere, 3=Cylinder (point helper cross).
+	-- Bones use a separate code path because Max Bone has no `size` arg.
+	fn makeShape shapeCode nodeName sz wcol =
+	(
+		case shapeCode of
+		(
+			2: ( sphere name:nodeName radius:sz segs:6 wirecolor:wcol )
+			3: ( point name:nodeName size:sz cross:true box:false axisTripod:false centermarker:false wirecolor:wcol )
+			default: ( point name:nodeName size:sz cross:false box:true axisTripod:false centermarker:false wirecolor:wcol )
+		)
+	),
+
+	-- Persist all profiles + the active selection back to the INI file.
+	-- Uses setINISetting (per-key) which is more reliable than rewriting the
+	-- whole file ourselves and avoids the GamePacks/edit-file dance 1.16b did.
+	fn saveToFile =
+	(
+		setINISetting ImporterInitFile "W3D_Importer" "CurrentProfile" (CurrentProfile as string)
+		for i = 1 to 5 do
+			if W3DPaths[i] != undefined do setINISetting ImporterInitFile "W3D_Importer" ("W3DPath_" + i as string) W3DPaths[i]
+		-- Clear and rewrite the profiles list (so a deleted profile vanishes).
+		for i = 1 to 20 do delIniSetting ImporterInitFile "Profiles_List" (i as string)
+		for i = 1 to ProfilesList.count do
+			setINISetting ImporterInitFile "Profiles_List" (i as string) ProfilesList[i]
+		-- Per-profile sections.
+		for i = 1 to ProfilesList.count do
+		(
+			local idx = (12 * (i - 1))
+			local sect = ProfilesList[i]
+			setINISetting ImporterInitFile sect "BoneShape"      (valToShape UserProfiles[idx + 1])
+			setINISetting ImporterInitFile sect "BoneSize"       (UserProfiles[idx + 2] as string)
+			setINISetting ImporterInitFile sect "BoneColor"      (ColorToString UserProfiles[idx + 3])
+			setINISetting ImporterInitFile sect "ProxyShape"     (valToShape UserProfiles[idx + 4])
+			setINISetting ImporterInitFile sect "ProxySize"      (UserProfiles[idx + 5] as string)
+			setINISetting ImporterInitFile sect "ProxyColor"     (ColorToString UserProfiles[idx + 6])
+			setINISetting ImporterInitFile sect "AggregateShape" (valToShape UserProfiles[idx + 7])
+			setINISetting ImporterInitFile sect "AggregateSize"  (UserProfiles[idx + 8] as string)
+			setINISetting ImporterInitFile sect "AggregateColor" (ColorToString UserProfiles[idx + 9])
+			setINISetting ImporterInitFile sect "DazzleShape"    (valToShape UserProfiles[idx + 10])
+			setINISetting ImporterInitFile sect "DazzleSize"     (UserProfiles[idx + 11] as string)
+			setINISetting ImporterInitFile sect "DazzleColor"    (ColorToString UserProfiles[idx + 12])
+		)
+	),
+
+	fn init =
+	(
+		if Initialized do return false
+
+		-- Defaults: same baseline values as 1.16b for the three reference profiles
+		-- (Default / Default Characters / Default Vehicles), minus the trailing
+		-- CreateMeshesBones field which v20 doesn't use.
+		ProfilesDefaults = #( \
+			1, 0.0, (color 0 0 255),   1, 1.0, (color 255 255 0),   1, 1.0, (color 255 155 247), 2, 1.0, (color 255 0 0), \
+			1, 0.1, (color 0 0 255),   1, 0.2, (color 255 255 0),   1, 0.2, (color 255 155 247), 2, 0.3, (color 255 0 0), \
+			1, 0.2, (color 0 0 255),   1, 1.0, (color 255 255 0),   1, 0.3, (color 255 155 247), 2, 0.5, (color 255 0 0))
+
+		local Shapes = #("box", "sphere", "cylinder")
+		local sectionFields = #( \
+			#("BoneShape",      "shape"), #("BoneSize",      "size"), #("BoneColor",      "color"), \
+			#("ProxyShape",     "shape"), #("ProxySize",     "size"), #("ProxyColor",     "color"), \
+			#("AggregateShape", "shape"), #("AggregateSize", "size"), #("AggregateColor", "color"), \
+			#("DazzleShape",    "shape"), #("DazzleSize",    "size"), #("DazzleColor",    "color"))
+
+		CurrentProfile = (getINISetting ImporterInitFile "W3D_Importer" "CurrentProfile") as integer
+		if CurrentProfile == 0 or CurrentProfile == undefined do CurrentProfile = 1
+
+		W3DPaths = #()
+		for i = 1 to 5 do
+		(
+			local p = getINISetting ImporterInitFile "W3D_Importer" ("W3DPath_" + i as string)
+			if p != "" do append W3DPaths p
+		)
+		if W3DPaths.count == 0 do W3DPaths[1] = (getDir #maxroot)
+
+		-- Profiles list: read indices 1..20 until we hit a gap.
+		ProfilesList = #()
+		local pid = 1
+		while pid <= 20 do
+		(
+			local val = getINISetting ImporterInitFile "Profiles_List" (pid as string)
+			if val == "" do exit
+			ProfilesList[pid] = val
+			pid += 1
+		)
+		if ProfilesList[1] == undefined do ProfilesList[1] = "Default"
+		if ProfilesList[2] == undefined do ProfilesList[2] = "Default Characters"
+		if ProfilesList[3] == undefined do ProfilesList[3] = "Default Vehicles"
+
+		-- Pull values for each profile, falling back to defaults when the INI
+		-- doesn't have a key (or the profile is one we just created on first run).
+		UserProfiles = #()
+		for i = 1 to ProfilesList.count do
+		(
+			local idx = (12 * (i - 1))
+			for f = 1 to 12 do
+			(
+				local fname = sectionFields[f][1]
+				local ftype = sectionFields[f][2]
+				local raw = getINISetting ImporterInitFile ProfilesList[i] fname
+				local resolved
+				if raw == "" then
+				(
+					if i <= 3 then resolved = getProfileDefaults i fieldName:fname
+					else            resolved = getProfileDefaults 1 fieldName:fname
+				)
+				else
+				(
+					case ftype of
+					(
+						"shape": resolved = (findItem Shapes raw)
+						"size":  resolved = (raw as float)
+						"color":
+						(
+							local parts = filterString raw ","
+							if parts.count >= 3 then
+								resolved = color (parts[1] as float) (parts[2] as float) (parts[3] as float)
+							else
+								resolved = (if i <= 3 then getProfileDefaults i fieldName:fname else getProfileDefaults 1 fieldName:fname)
+						)
+					)
+				)
+				UserProfiles[idx + f] = resolved
+			)
+		)
+
+		if CurrentProfile > ProfilesList.count do CurrentProfile = 1
+
+		Initialized = true
+	)
+)
+
+global W3DImporterInit = W3D_Importer_Init()
+
+rollout W3DNewProfile "New Profile" width:323 height:85
+(
+	local NewName
+	edittext ProfileName "Profile Name : " pos:[27,20] fieldWidth:195 text:"New Profile" align:#left
+	button OKButton "OK" pos:[159,60] width:75
+	button CancelButton "Cancel" pos:[240,60] width:75
+
+	fn Open XYPos =
+	(
+		NewName = undefined
+		createDialog W3DNewProfile style:#(#style_titlebar, #style_sysmenu) modal:true
+	)
+
+	on OKButton pressed do
+	(
+		if ProfileName.text.count > 0 do
+		(
+			NewName = ProfileName.text
+			destroyDialog W3DNewProfile
+		)
+	)
+	on CancelButton pressed do destroyDialog W3DNewProfile
+)
+
+rollout W3DPreferences "W3D Importer Preferences" width:418 height:425
+(
+	local ProfilesSettings = #()
+
+	groupBox Settings "Settings:" width:410 height:307 pos:[4,9]
+
+	label ProfileLabel "Profile : " pos:[14,33] align:#left
+	dropdownlist ProfileCombo pos:[56,30] width:196 align:#left
+	button NewButton "New" pos:[257,30] width:70
+	button DeleteButton "Delete" pos:[333,30] width:71
+
+	label bShapeLabel "Bones Shape :" pos:[18,70] align:#left
+	dropdownlist bShapeCombo pos:[95,67] width:81 height:5 align:#left tooltip:"Pick 'Bone' if you plan to use Auto-Bind > max skin. Geometry / Point Helper pivots aren't recognised as Max bones, so max-skin will skip them and skinning will fail."
+	edittext bSizeEdit "Bones Size : " pos:[29,100] fieldWidth:80 align:#left
+	colorpicker bColorPick "Bones Color : " pos:[25,127] fieldWidth:80 title:"Bones Color" align:#left
+
+	label pShapeLabel "Proxies Shape :" pos:[14,169] align:#left
+	dropdownlist pShapeCombo pos:[95,166] width:81 height:5 align:#left
+	edittext pSizeEdit "Proxies Size : " pos:[25,199] fieldWidth:80 align:#left
+	colorpicker pColorPick "Proxies Color : " pos:[21,226] fieldWidth:80 title:"Proxies Color" align:#left
+
+	label aShapeLabel "Aggregates Shape : " pos:[223,70] align:#left
+	dropdownlist aShapeCombo pos:[324,67] width:81 height:5 align:#left
+	edittext aSizeEdit "Aggregates Size : " pos:[234,100] fieldWidth:80 align:#left
+	colorpicker aColorPick "Aggregates Color : " pos:[230,127] fieldWidth:80 title:"Aggregates Color" align:#left
+
+	label dShapeLabel "Dazzles Shape : " pos:[240,169] align:#left
+	dropdownlist dShapeCombo pos:[324,166] width:81 height:5 align:#left
+	edittext dSizeEdit "Dazzles Size : " pos:[251,199] fieldWidth:80 align:#left
+	colorpicker dColorPick "Dazzles Color : " pos:[247,226] fieldWidth:80 title:"Dazzles Color" align:#left
+
+	label sizeNote "Note: Size 0 = auto-fit from imported bbox." pos:[18,270] width:380
+	button RestoreButton "Restore" pos:[329,290] width:75
+
+	groupBox W3DPathGroup "Default W3D Path:" width:410 height:57 pos:[4,326]
+	dropdownlist W3DPathCombo pos:[14,347] width:310 align:#left
+	button BrowseButton "Browse" pos:[329,347] width:75
+
+	button OkButton "OK" pos:[173,395] width:75
+	button CancelButton "Cancel" pos:[254,395] width:75
+	button ApplyButton "Apply" pos:[335,395] width:75
+
+	fn UpdateProfile sel restore:false isNew:false fromInit:false =
+	(
+		local index = (12 * (sel - 1))
+
+		if sel <= 3 then
+		(
+			DeleteButton.enabled = false
+			RestoreButton.enabled = true
+		)
+		else
+		(
+			DeleteButton.enabled = true
+			RestoreButton.enabled = false
+		)
+
+		if isNew do
+		(
+			W3DNewProfile.Open (getDialogPos W3DPreferences)
+			local newName = W3DNewProfile.NewName
+			if newName != undefined then
+			(
+				local tmpProfiles = ProfileCombo.items
+				-- Disambiguate duplicate names with (n) suffix.
+				if findItem tmpProfiles newName > 0 do
+				(
+					local nameIndex = 2
+					local nameIndexArray = #()
+					for i = 1 to tmpProfiles.count do
+					(
+						local s = tmpProfiles[i]
+						if matchPattern s pattern:(newName + "(*)") do
+						(
+							nameIndex = (trimRight (trimLeft s (newName + "(")) ")") as integer
+							append nameIndexArray nameIndex
+						)
+					)
+					for i = 0 to nameIndexArray.count do
+					(
+						if findItem nameIndexArray (i + 2) == 0 then
+						(
+							nameIndex = i + 2
+							exit
+						)
+					)
+					newName = newName + "(" + (nameIndex as string) + ")"
+				)
+				append tmpProfiles newName
+				ProfileCombo.items = tmpProfiles
+				ProfileCombo.selection = tmpProfiles.count
+				sel = tmpProfiles.count
+				index = (12 * (sel - 1))
+				-- New profile inherits Default values.
+				restore = true
+			)
+			else return false
+		)
+
+		if restore do
+		(
+			-- For built-in profiles 1..3, restore from their own defaults; for
+			-- user-created profiles, fall back to Default's defaults.
+			local srcIdx = if sel <= 3 then sel else 1
+			local d = W3DImporterInit.getProfileDefaults srcIdx
+			for i = 0 to 11 do ProfilesSettings[index + i + 1] = d[i + 1]
+		)
+
+		bShapeCombo.selection = ProfilesSettings[index + 1]
+		bSizeEdit.text  = ProfilesSettings[index + 2] as string
+		bColorPick.color = ProfilesSettings[index + 3]
+		pShapeCombo.selection = ProfilesSettings[index + 4]
+		pSizeEdit.text  = ProfilesSettings[index + 5] as string
+		pColorPick.color = ProfilesSettings[index + 6]
+		aShapeCombo.selection = ProfilesSettings[index + 7]
+		aSizeEdit.text  = ProfilesSettings[index + 8] as string
+		aColorPick.color = ProfilesSettings[index + 9]
+		dShapeCombo.selection = ProfilesSettings[index + 10]
+		dSizeEdit.text  = ProfilesSettings[index + 11] as string
+		dColorPick.color = ProfilesSettings[index + 12]
+
+		ApplyButton.enabled = not fromInit
+	)
+
+	fn UpdateSettings field val =
+	(
+		local index = (12 * (ProfileCombo.selection - 1))
+		case field of
+		(
+			"BoneShape":      ProfilesSettings[index + 1]  = val
+			"BoneSize":       ProfilesSettings[index + 2]  = val as float
+			"BoneColor":      ProfilesSettings[index + 3]  = val
+			"ProxyShape":     ProfilesSettings[index + 4]  = val
+			"ProxySize":      ProfilesSettings[index + 5]  = val as float
+			"ProxyColor":     ProfilesSettings[index + 6]  = val
+			"AggregateShape": ProfilesSettings[index + 7]  = val
+			"AggregateSize":  ProfilesSettings[index + 8]  = val as float
+			"AggregateColor": ProfilesSettings[index + 9]  = val
+			"DazzleShape":    ProfilesSettings[index + 10] = val
+			"DazzleSize":     ProfilesSettings[index + 11] = val as float
+			"DazzleColor":    ProfilesSettings[index + 12] = val
+		)
+		ApplyButton.enabled = true
+	)
+
+	fn UpdateW3DPaths val =
+	(
+		local tmpPaths = W3DPathCombo.items
+		local pathCount = tmpPaths.count
+		local currentPath = tmpPaths[val]
+		if pathCount > 1 do
+		(
+			while pathCount > 1 do
+			(
+				if pathCount <= val do tmpPaths[pathCount] = tmpPaths[pathCount - 1]
+				pathCount -= 1
+			)
+			tmpPaths[1] = currentPath
+			W3DPathCombo.items = tmpPaths
+			W3DPathCombo.selection = 1
+		)
+		ApplyButton.enabled = true
+	)
+
+	fn ApplyChanges =
+	(
+		W3DImporterInit.ProfilesList = #()
+		join W3DImporterInit.ProfilesList ProfileCombo.items
+		W3DImporterInit.UserProfiles = #()
+		join W3DImporterInit.UserProfiles ProfilesSettings
+		W3DImporterInit.W3DPaths = #()
+		join W3DImporterInit.W3DPaths W3DPathCombo.items
+		W3DImporterInit.CurrentProfile = ProfileCombo.selection
+		W3DImporterInit.saveToFile()
+		ApplyButton.enabled = false
+	)
+
+	fn doInit =
+	(
+		if not W3DImporterInit.Initialized do W3DImporterInit.init()
+		-- Display labels: indices still map to 1=Box, 2=Sphere, 3=Cylinder in the
+		-- INI's shape vocabulary (so 1.16b INI files stay readable). Only the
+		-- user-facing names changed.
+		local Shapes = #("Bone", "Geometry", "Point Helper")
+		ProfilesSettings = #()
+		join ProfilesSettings W3DImporterInit.UserProfiles
+
+		ProfileCombo.items = #()
+		local pl = #()
+		join pl W3DImporterInit.ProfilesList
+		ProfileCombo.items = pl
+		ProfileCombo.selection = W3DImporterInit.CurrentProfile
+
+		bShapeCombo.items = Shapes
+		pShapeCombo.items = Shapes
+		aShapeCombo.items = Shapes
+		dShapeCombo.items = Shapes
+
+		W3DPathCombo.items = (local p = #(); join p W3DImporterInit.W3DPaths; p)
+
+		UpdateProfile ProfileCombo.selection fromInit:true
+	)
+
+	fn Open XYPos =
+	(
+		createDialog W3DPreferences style:#(#style_titlebar, #style_sysmenu)
+		doInit()
+		setFocus W3DPreferences
+	)
+
+	on ProfileCombo selected val do UpdateProfile val
+	on NewButton pressed do
+	(
+		if ProfileCombo.items.count < 20 then UpdateProfile (ProfileCombo.items.count + 1) isNew:true
+		else messageBox "Profile limit (20) reached. Delete unused profiles first." title:"Profiles Limit" beep:true
+	)
+	on DeleteButton pressed do
+	(
+		local profileCount = ProfileCombo.items.count
+		local delProfile = ProfileCombo.selection
+		if delProfile <= 3 do return false   -- built-ins are protected
+
+		local tmpSettings = #()
+		local tmpProfiles = #()
+		for i = 1 to profileCount do
+		(
+			if i != delProfile do
+			(
+				local idx = (12 * (i - 1))
+				for j = 1 to 12 do append tmpSettings ProfilesSettings[idx + j]
+				append tmpProfiles ProfileCombo.items[i]
+			)
+		)
+		ProfilesSettings = tmpSettings
+		ProfileCombo.items = tmpProfiles
+		if delProfile > tmpProfiles.count do ProfileCombo.selection = tmpProfiles.count
+		UpdateProfile ProfileCombo.selection
+		ApplyButton.enabled = true
+	)
+
+	on bShapeCombo selected val do UpdateSettings "BoneShape" val
+	on bSizeEdit changed val do UpdateSettings "BoneSize" val
+	on bColorPick changed val do UpdateSettings "BoneColor" val
+	on pShapeCombo selected val do UpdateSettings "ProxyShape" val
+	on pSizeEdit changed val do UpdateSettings "ProxySize" val
+	on pColorPick changed val do UpdateSettings "ProxyColor" val
+	on aShapeCombo selected val do UpdateSettings "AggregateShape" val
+	on aSizeEdit changed val do UpdateSettings "AggregateSize" val
+	on aColorPick changed val do UpdateSettings "AggregateColor" val
+	on dShapeCombo selected val do UpdateSettings "DazzleShape" val
+	on dSizeEdit changed val do UpdateSettings "DazzleSize" val
+	on dColorPick changed val do UpdateSettings "DazzleColor" val
+
+	on RestoreButton pressed do UpdateProfile ProfileCombo.selection restore:true
+
+	on W3DPathCombo selected val do UpdateW3DPaths val
+	on BrowseButton pressed do
+	(
+		local picked = getSavePath caption:"Choose Default W3D Folder"
+		if picked != undefined do
+		(
+			local existing = findItem W3DPathCombo.items picked
+			if existing > 0 then UpdateW3DPaths existing
+			else
+			(
+				local tmpPaths = W3DPathCombo.items
+				local pathCount = tmpPaths.count + 1
+				while pathCount > 1 do
+				(
+					if pathCount <= 5 do tmpPaths[pathCount] = tmpPaths[pathCount - 1]
+					pathCount -= 1
+				)
+				tmpPaths[1] = picked
+				W3DPathCombo.items = tmpPaths
+				W3DPathCombo.selection = 1
+				ApplyButton.enabled = true
+			)
+		)
+	)
+
+	on OkButton     pressed do ( if ApplyButton.enabled do ApplyChanges(); destroyDialog W3DPreferences )
+	on CancelButton pressed do destroyDialog W3DPreferences
+	on ApplyButton  pressed do ApplyChanges()
+)
+
+-- ============================================================================
+-- MIX file support (ported from w3d-importer-1.16b.ms)
+-- Renegade .mix / .pkg / .dat container format. Layout (after the 4-byte
+-- "MIX1" magic):
+--   uint32 filesIndexOffset   -- jumps to the per-entry (id, offset, size) table
+--   uint32 namesTableOffset   -- jumps to the parallel filename table
+-- Names table: uint32 count, then `count` length-prefixed strings.
+-- Files index: uint32 count, then `count` * (uint32 id, uint32 offset, uint32 size).
+-- The two arrays share an index, so name[i] <-> entry[i].
+-- ============================================================================
+
+struct Mix_File
+(
+	MixID, MixFilesOffset, MixNamesOffset, MixNumFilesNames, MixNumFiles,
+	MixFileID, MixFileOffset, MixFileSize,
+
+	fn ReadMix MixStream =
+	(
+		local mixStr = ""
+		for i = 1 to 4 do mixStr += bit.IntAsChar (readByte MixStream #unsigned)
+		MixID = mixStr
+		if MixID != "MIX1" do return false
+		MixFilesOffset = ReadLong MixStream #unsigned
+		MixNamesOffset = ReadLong MixStream #unsigned
+		true
+	),
+
+	fn getMixFilesNames MixStream =
+	(
+		local filesNames = #()
+		fseek MixStream MixNamesOffset #seek_Set
+		MixNumFilesNames = ReadLong MixStream #unsigned
+		for i = 1 to MixNumFilesNames do
+		(
+			local nameStr = ""
+			local NameLen = ReadByte MixStream #unsigned
+			for j = 1 to NameLen do nameStr += bit.IntAsChar (readByte MixStream #unsigned)
+			append filesNames nameStr
+		)
+		filesNames
+	),
+
+	fn getMixFile MixStream FileIndex =
+	(
+		fseek MixStream MixFilesOffset #seek_Set
+		MixNumFiles = ReadLong MixStream #unsigned
+		if MixNumFiles != MixNumFilesNames do
+		(
+			format "Mix index/names mismatch: % vs %\n" MixNumFiles MixNumFilesNames
+			return false
+		)
+		local fileIndexOffset = (ftell MixStream) + (12 * (FileIndex - 1))
+		fseek MixStream fileIndexOffset #seek_Set
+		MixFileID     = ReadLong MixStream #unsigned
+		MixFileOffset = ReadLong MixStream #unsigned
+		MixFileSize   = ReadLong MixStream #unsigned
+		true
+	)
+)
+
+-- Extract one entry from a mix to a temp file. Returns the temp path on
+-- success, undefined on failure. We chunk the copy in 64 KiB blocks so the
+-- byte-by-byte readByte loop doesn't stall on multi-MB W3Ds (a 5 MB asset
+-- would be ~5 million MAXScript calls otherwise).
+fn ExtractMixEntry mixPath entryName outPath =
+(
+	local mixStream = fopen mixPath "rb"
+	if mixStream == undefined do return undefined
+	local mf = Mix_File()
+	if not mf.ReadMix mixStream do ( fclose mixStream; return undefined )
+	local names = mf.getMixFilesNames mixStream
+	local idx = findItem names entryName
+	if idx == 0 do ( fclose mixStream; return undefined )
+	if not mf.getMixFile mixStream idx do ( fclose mixStream; return undefined )
+
+	fseek mixStream mf.MixFileOffset #seek_Set
+	local out = fopen outPath "wb"
+	if out == undefined do ( fclose mixStream; return undefined )
+
+	local remaining = mf.MixFileSize
+	local blockSize = 65536
+	while remaining > 0 do
+	(
+		local n = if remaining < blockSize then remaining else blockSize
+		for i = 1 to n do WriteByte out (ReadByte mixStream #unsigned)
+		remaining -= n
+	)
+	fclose out
+	fclose mixStream
+	outPath
+)
+
+-- Multi-select listbox of .w3d entries inside the chosen mix. The listbox is
+-- populated by the caller before the dialog opens (via global so the rollout
+-- doesn't need a struct-style accessor).
+global mixDlgEntries = #()
+global mixDlgSelected = #()
+global mixDlgUseAdvanced = false
+
+rollout SelectFromMixDlg "Select W3D File(s) From Mix" width:340 height:465
+(
+	multiListBox lbW3D "" pos:[10,10] width:320 height:25
+	checkbox ckbAdvanced "Use Advanced Import for each file" pos:[10,395] width:300 height:18 \
+		tooltip:"When checked, each selected entry opens the Renegade Advanced Import dialog (LOD / mesh / proxy / animation picker) per file. Otherwise files import in bulk using the Basic-tab settings."
+	button btnAll    "All"     pos:[10,420] width:50
+	button btnNone   "None"    pos:[65,420] width:50
+	button btnInvert "Invert"  pos:[120,420] width:60
+	button btnImport "Import"  pos:[195,420] width:65 default:true
+	button btnCancel "Cancel"  pos:[265,420] width:65
+
+	on SelectFromMixDlg open do
+	(
+		lbW3D.items = mixDlgEntries
+		mixDlgSelected = #()
+		ckbAdvanced.checked = mixDlgUseAdvanced
+		-- Dynamic tooltip: temp dir varies per user (lives under their AppData),
+		-- so resolve at open-time rather than baking it in.
+		btnImport.tooltip = "Extracts selected entries to:\n" + (getDir #temp)
+	)
+
+	on btnAll    pressed do lbW3D.selection = #{1..lbW3D.items.count}
+	on btnNone   pressed do lbW3D.selection = #{}
+	on btnInvert pressed do
+	(
+		local inv = #{}
+		for i = 1 to lbW3D.items.count do if not lbW3D.selection[i] do inv[i] = true
+		lbW3D.selection = inv
+	)
+	on btnImport pressed do
+	(
+		local picks = #()
+		for i in lbW3D.selection do append picks lbW3D.items[i]
+
+		-- Warn before committing to N Advanced dialogs in a row, since the user
+		-- has to click through each one. >=2 because a single file getting one
+		-- dialog is the expected Advanced flow, no warning needed.
+		if ckbAdvanced.checked and picks.count >= 2 do
+		(
+			local msg = "You selected " + (picks.count as string) + " files with Advanced Import enabled.\n" + \
+				"The Advanced Import dialog will open " + (picks.count as string) + " times in sequence — " + \
+				"once per file.\n\nContinue?"
+			if not (queryBox msg title:"Multiple Advanced Imports" beep:true) do return false
+		)
+
+		mixDlgSelected = picks
+		mixDlgUseAdvanced = ckbAdvanced.checked
+		destroyDialog SelectFromMixDlg
+	)
+	on btnCancel pressed do
+	(
+		mixDlgSelected = #()
+		destroyDialog SelectFromMixDlg
+	)
+)
+
+-- File > Select From Mix handler. Opens the mix, lists .w3d entries, lets the
+-- user pick (multi-select), extracts each selected entry to (getDir #temp),
+-- and runs cfW3DImporter on each. Per-file Basic-tab settings (no Advanced
+-- dialog) — bulk operations shouldn't pop N dialogs.
+fn DoSelectFromMix =
+(
+	local mixPath = getOpenFileName caption:"Select Mix file" \
+		types:"MIX (*.mix)|*.mix|Package (*.pkg)|*.pkg|DAT (*.dat)|*.dat|All Files (*.*)|*.*|"
+	if mixPath == undefined do return false
+
+	-- Parse the mix index up front so we can populate the dialog.
+	local s = fopen mixPath "rb"
+	if s == undefined do ( messageBox "Could not open mix file." beep:true; return false )
+	local mf = Mix_File()
+	if not mf.ReadMix s do
+	(
+		fclose s
+		messageBox "Invalid or unsupported mix file (no MIX1 magic)." beep:true
+		return false
+	)
+	local names = mf.getMixFilesNames s
+	fclose s
+
+	-- Filter to .w3d only, sorted for browsability.
+	local w3dEntries = #()
+	for n in names do
+		if matchPattern (getFileNameType n) pattern:".w3d" do append w3dEntries n
+	if w3dEntries.count == 0 do
+	(
+		messageBox "No .w3d entries found in this mix." title:"Empty Mix" beep:true
+		return false
+	)
+	sort w3dEntries
+
+	mixDlgEntries  = w3dEntries
+	mixDlgSelected = #()
+	createDialog SelectFromMixDlg modal:true style:#(#style_titlebar, #style_sysmenu, #style_resizing)
+	if mixDlgSelected.count == 0 do return false
+
+	-- Snapshot the Basic-tab settings once; mix-extracted files all use the
+	-- same config (consistent with batch-import behaviour). Mirrors btnW3DImporter's
+	-- non-batch branch so prefs / WWSkin / split / auto-bind all apply.
+	local splt   = try ( rltMain.ckbSplitDependencies.checked ) catch ( false )
+	local autoB  = try ( rltMain.rbgAutoBind.state )            catch ( 0 )
+	local dbg    = try ( rltMain.ckbDebugOutput.checked )       catch ( false )
+	local w3dmat = try ( rltMain.ckbUseW3DMatl.checked )        catch ( false )
+	local ignE   = try ( not rltMain.ckbIgnoreErrors.checked )  catch ( true )
+	local fxN    = try ( rltMain.ckbFixNormals.checked )        catch ( false )
+	local t2d    = try ( rltMain.ckbTga2Dds.checked )           catch ( false )
+	local fxV    = try ( rltMain.ckbFixVertices.checked )       catch ( false )
+	local nmm    = try ( rltMain.ckbNoMultiMat.checked )        catch ( false )
+	local t2dr   = try ( rltMain.ckbTga2DdsRev.checked )        catch ( false )
+	local wwsk   = try ( rltMain.ckbUseWWSkin.checked )         catch ( false )
+	local extW3D = try ( rltMain.ckbImportExtendedW3D.checked ) catch ( false )
+	local extSkel = try ( if rltMain.ckbUseExternalSkel.checked then rltMain.externalSkeletonFile else undefined ) catch ( undefined )
+
+	local tmpDir = getDir #temp
+	local mixBase = getFilenameFile mixPath
+	local extracted = #()
+	for entry in mixDlgSelected do
+	(
+		-- Namespace temp filenames by mix basename so two mixes with the same
+		-- entry name don't clobber each other across consecutive imports.
+		local outPath = tmpDir + "\\w3di_" + mixBase + "_" + entry
+		local got = ExtractMixEntry mixPath entry outPath
+		if got != undefined then append extracted got
+		else format "Failed to extract: %\n" entry
+	)
+	if extracted.count == 0 do
+	(
+		messageBox "Extraction failed for all selected entries." beep:true
+		return false
+	)
+
+	if mixDlgUseAdvanced then
+	(
+		-- Open the Renegade Advanced dialog once per extracted file. Modal so
+		-- the loop blocks until the user clicks Import / Cancel / Bones-only,
+		-- which is the only way to drive a one-at-a-time inspect-and-import
+		-- flow without dropping files. The Renegade dialog already calls
+		-- cfW3DImporter and destroys itself on its terminal buttons.
+		for f in extracted do
+		(
+			try ( destroyDialog rltRenegade ) catch ()
+			::rnPendingFile = f
+			createDialog rltRenegade modal:true
+		)
+	)
+	else
+	(
+		-- batch=false: cfW3DImporter only pops the file picker when batch=false AND
+		-- w3dfilename==undefined; we always pass a path here, so the picker stays
+		-- shut. batch=true would also save the imported scene as a .max next to the
+		-- source and reset the scene — fine for folder batches, wrong for us.
+		for f in extracted do
+			cfW3DImporter f splt autoB false dbg w3dmat ignE fxN t2d fxV nmm t2dr wwsk extSkel extW3D
+	)
+	true
+)
+
+rcMenu rltMainMenu
+(
+	subMenu "&File"
+	(
+		menuItem mi_w3d "Select &W3D..."
+		menuItem mi_mix "Select From &Mix..."
+	)
+	subMenu "&Edit"
+	(
+		menuItem mi_prefs "&Preferences..."
+		separator sep_edit_1
+		menuItem mi_clean "Clean &Temp"
+	)
+	on mi_w3d picked do
+	(
+		-- Mirror the non-batch branch of btnW3DImporter so the menu entry behaves
+		-- identically to the "Import a file" button (lets the user pick a single
+		-- .w3d via the standard file dialog).
+		try ( rltMain.btnW3DImporter.pressed() ) catch
+		(
+			-- Fallback: snapshot settings and call directly. Reachable only if the
+			-- rollout's button event-firing API isn't available on this Max version.
+			local splt   = try ( rltMain.ckbSplitDependencies.checked ) catch ( false )
+			local autoB  = try ( rltMain.rbgAutoBind.state )            catch ( 0 )
+			local dbg    = try ( rltMain.ckbDebugOutput.checked )       catch ( false )
+			local w3dmat = try ( rltMain.ckbUseW3DMatl.checked )        catch ( false )
+			local ignE   = try ( not rltMain.ckbIgnoreErrors.checked )  catch ( true )
+			local fxN    = try ( rltMain.ckbFixNormals.checked )        catch ( false )
+			local t2d    = try ( rltMain.ckbTga2Dds.checked )           catch ( false )
+			local fxV    = try ( rltMain.ckbFixVertices.checked )       catch ( false )
+			local nmm    = try ( rltMain.ckbNoMultiMat.checked )        catch ( false )
+			local t2dr   = try ( rltMain.ckbTga2DdsRev.checked )        catch ( false )
+			local wwsk   = try ( rltMain.ckbUseWWSkin.checked )         catch ( false )
+			local extW3D = try ( rltMain.ckbImportExtendedW3D.checked ) catch ( false )
+			cfW3DImporter undefined splt autoB false dbg w3dmat ignE fxN t2d fxV nmm t2dr wwsk undefined extW3D
+		)
+	)
+	on mi_mix picked do DoSelectFromMix()
+	on mi_prefs picked do W3DPreferences.Open (try (getDialogPos rltMain) catch ([100,100]))
+	on mi_clean picked do
+	(
+		-- Delete the w3di_*.w3d files we extracted from mixes into Max's temp
+		-- directory. Pattern matches our ExtractMixEntry naming scheme; nothing
+		-- else in #temp uses that prefix, so unrelated Max temp data is safe.
+		local pat = (getDir #temp) + "\\w3di_*.w3d"
+		local hits = getFiles pat
+		local removed = 0
+		for f in hits do ( if (deleteFile f) do removed += 1 )
+		messageBox ("Cleaned " + (removed as string) + " temp file(s) from\n" + (getDir #temp)) \
+			title:"Clean Temp" beep:false
 	)
 )
 
 macroscript ImportW3D
-	category: "W3D Importer/Processor"
+	category: "W3D Importer/Processor v20"
 	buttontext: "Import W3D"
 	tooltip: "W3D Importer"
 	icon:#("gMax",2)
-( createDialog rltMain )
+( createDialog rltMain menu:rltMainMenu )
 
-rollout rltMain "W3D Importer" width:177 height:292
+rollout rltMain "W3D Importer v20" width:177 height:314
 (
 	button btnW3DImporter "Import a file" pos:[25,17] width:127 height:36
+	button btnRenegade     "Advanced Import" pos:[25,57] width:127 height:18 tooltip:"Open a .w3d file in the advanced import dialog — inspect meshes, bones, aggregates and proxies, choose LODs and animation range, then import all or selected items."
 
 	-- Tab strip: clicking these toggles which group of controls is visible below.
 	-- (MAXScript rollouts have no native tab control, but a radio-button strip is the
 	-- conventional substitute and behaves exactly like tabs.)
-	radiobuttons rbgTab "" pos:[12,60] width:153 height:18 labels:#("Basic", "Advanced") default:1 columns:2
+	radiobuttons rbgTab "" pos:[12,82] width:153 height:18 labels:#("Basic", "Advanced") default:1 columns:2
 
 	-- BASIC tab controls
-	checkbox ckbSplitDependencies "Split by dependencies" pos:[25,85] width:127 height:15 enabled:true
-	checkbox ckbAutoBind "Auto-Bind" pos:[25,102] width:127 height:15 checked:true
-	radiobuttons rbgAutoBind "Auto-Bind type" pos:[17,127] width:162 height:30 enabled:true labels:#("max skin", "w3d skin") default:1 columns:2
-	checkbox ckbBatchProcessing "Batch processing" pos:[25,165] width:127 height:15 checked:false
-	-- Pivot representation: 1 = Max Bone (default, original importer behaviour),
-	-- 2 = Sphere (V1.16-style; renders as a small green geom but max2w3d.dle
-	-- treats it as render geometry, NOT a W3D bone -- exporter / Select Bones
-	-- won't see it), 3 = Point Helper (recommended alternative -- HELPER_CLASS_ID
-	-- so W3D Tools' Select Bones picks it up and it stays out of the geometry
-	-- export).
-	dropDownList ddlPivotType "Pivots:" pos:[25,182] width:152 height:40 items:#("Bone (default)", "Sphere", "Point Helper (slow)") selection:1 tooltip:"How to represent imported hierarchy pivots in the scene. Bone = Max bone (original). Sphere = V1.16-style green sphere (visual only -- gets exported as geometry!). Point Helper = small marker that W3D Tools recognises as a bone."
+	checkbox ckbSplitDependencies "Split by dependencies" pos:[25,107] width:127 height:15 enabled:true
+	checkbox ckbAutoBind "Auto-Bind" pos:[25,124] width:127 height:15 checked:true
+	radiobuttons rbgAutoBind "Auto-Bind type" pos:[17,149] width:162 height:30 enabled:true labels:#("max skin", "w3d skin") default:1 columns:2
+	checkbox ckbBatchProcessing "Batch processing" pos:[25,187] width:127 height:15 checked:false
+	-- Pivot shape/size/color now come from the active W3DPreferences profile (Edit > Preferences).
+	-- v19: bone-fins display toggle (defaults on to match v18 behaviour); pure-anim FBX bake (batch only).
+	checkbox ckbShowBoneFins "Show bone fins" pos:[25,210] width:127 height:15 checked:true tooltip:"Display fins/links on imported max bones. When unchecked, sets showLinks/showFins false and zeros fin sizes. Viewport-only, no effect on export."
+	checkbox ckbPureAnim     "Pure animation"  pos:[25,227] width:127 height:15 checked:false tooltip:"After import, export an .fbx next to the source .w3d (same basename). Works in both single-file and batch mode. Useful for baking out anim-only clips. Requires the FBX exporter plugin."
 
 	-- ADVANCED tab controls (overlap the same vertical space; visibility toggled by rbgTab)
-	checkbox ckbDebugOutput "Debug Output" pos:[25,85] width:127 height:15 checked:false visible:false
-	checkbox ckbUseW3DMatl "Use W3D Materials" pos:[25,102] width:127 height:15 checked:false visible:false
-	checkbox ckbImportExtendedW3D "Import extended W3D Info" pos:[25,119] width:152 height:15 checked:false visible:false tooltip:"Restore each mesh's W3D Tools settings (Geometry Type, geometry flags like Hide / 2-Sided / Shadow / Shatter / Tangents / Prelit / AlwaysDynLight, Collision flags, Static Sort Level) from the imported .w3d's MESH_HEADER3 Attributes. Requires the rebuilt max2w3d.dle (provides wwSetFlags / wwSetSorting)."
-	checkbox ckbIgnoreErrors "Strict Mode" pos:[25,136] width:127 height:15 checked:false visible:false tooltip:"Halt the import if a channel references an invalid pivot ID, instead of skipping it."
-	checkbox ckbFixNormals "Fix Normals" pos:[25,153] width:127 height:15 checked:false visible:false tooltip:"Destructive fallback for W3D files with broken normals: forces all faces to one smoothing group, then resets normals via Edit_Normals."
-	checkbox ckbTga2Dds "tga2DDS" pos:[25,170] width:65 height:15 checked:false visible:false tooltip:"Rewrite .tga texture references to .dds (extension only; filename preserved)"
-	checkbox ckbTga2DdsRev "rev" pos:[92,170] width:60 height:15 checked:false enabled:false visible:false tooltip:"Reverse: rename .dds to .tga (only available while tga2DDS is enabled)"
-	checkbox ckbFixVertices "Fix Vertices" pos:[25,187] width:127 height:15 checked:false visible:false tooltip:"Per-element smoothing groups, then weld vertices at 0.01 threshold (preserves smoothing across the weld)"
-	checkbox ckbNoMultiMat "No Multi-Mat" pos:[25,204] width:127 height:15 checked:false visible:false tooltip:"Split meshes that would use a multi-material into separate meshes (one per texture), each with a single material assigned"
-	checkbox ckbUseWWSkin "Use 2023WWSkin" pos:[25,221] width:127 height:15 checked:false visible:false tooltip:"Bind skinned meshes using the 2023-toolchain WWSkin (Westwood Space Warp + WWSkin Binding) instead of Max's native Skin modifier. Requires the rebuilt max2w3d.dle (Phase 1+ of the WWSkin port)."
-	checkbox ckbUseExternalSkel "Use External Skeleton" pos:[25,238] width:127 height:15 checked:false visible:false tooltip:"Load the bone hierarchy from an external .w3d file (e.g. a shared skeleton) instead of the main w3d / auto-derive."
-	button btnSelectSkeleton "Select Skeleton" pos:[25,255] width:152 height:18 enabled:false visible:false
+	checkbox ckbDebugOutput "Debug Output" pos:[25,107] width:127 height:15 checked:false visible:false
+	checkbox ckbUseW3DMatl "Use W3D Materials" pos:[25,124] width:127 height:15 checked:false visible:false
+	checkbox ckbImportExtendedW3D "Import extended W3D Info" pos:[25,141] width:152 height:15 checked:false visible:false tooltip:"Restore each mesh's W3D Tools settings (Geometry Type, geometry flags like Hide / 2-Sided / Shadow / Shatter / Tangents / Prelit / AlwaysDynLight, Collision flags, Static Sort Level) from the imported .w3d's MESH_HEADER3 Attributes. Requires the rebuilt max2w3d.dle (provides wwSetFlags / wwSetSorting)."
+	checkbox ckbIgnoreErrors "Strict Mode" pos:[25,158] width:127 height:15 checked:false visible:false tooltip:"Halt the import if a channel references an invalid pivot ID, instead of skipping it."
+	checkbox ckbFixNormals "Fix Normals" pos:[25,175] width:127 height:15 checked:false visible:false tooltip:"Destructive fallback for W3D files with broken normals: forces all faces to one smoothing group, then resets normals via Edit_Normals."
+	checkbox ckbTga2Dds "tga2DDS" pos:[25,192] width:65 height:15 checked:false visible:false tooltip:"Rewrite .tga texture references to .dds (extension only; filename preserved)"
+	checkbox ckbTga2DdsRev "rev" pos:[92,192] width:60 height:15 checked:false enabled:false visible:false tooltip:"Reverse: rename .dds to .tga (only available while tga2DDS is enabled)"
+	checkbox ckbFixVertices "Fix Vertices" pos:[25,209] width:127 height:15 checked:false visible:false tooltip:"Per-element smoothing groups, then weld vertices at 0.01 threshold (preserves smoothing across the weld)"
+	checkbox ckbNoMultiMat "No Multi-Mat" pos:[25,226] width:127 height:15 checked:false visible:false tooltip:"Split meshes that would use a multi-material into separate meshes (one per texture), each with a single material assigned"
+	checkbox ckbUseWWSkin "Use 2023WWSkin" pos:[25,243] width:127 height:15 checked:false visible:false tooltip:"Bind skinned meshes using the 2023-toolchain WWSkin (Westwood Space Warp + WWSkin Binding) instead of Max's native Skin modifier. Requires the rebuilt max2w3d.dle (Phase 1+ of the WWSkin port)."
+	checkbox ckbUseExternalSkel "Use External Skeleton" pos:[25,260] width:127 height:15 checked:false visible:false tooltip:"Load the bone hierarchy from an external .w3d file (e.g. a shared skeleton) instead of the main w3d / auto-derive."
+	button btnSelectSkeleton "Select Skeleton" pos:[25,277] width:152 height:18 enabled:false visible:false
 
 	-- Path to the user-picked external skeleton w3d. Lives at rollout scope
 	-- so it survives across multiple imports without re-prompting.
@@ -4255,11 +6029,11 @@ rollout rltMain "W3D Importer" width:177 height:292
 			(
 				w3dFiles = getFiles(fldrPath + "\\*.w3d")
 				for i=1 to w3dFiles.count do
-				( cfW3DImporter w3dFiles[i] ckbSplitDependencies.checked rbgAutoBind.state true ckbDebugOutput.checked ckbUseW3DMatl.checked (not ckbIgnoreErrors.checked) ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked ckbUseWWSkin.checked (if ckbUseExternalSkel.checked then externalSkeletonFile else undefined) ckbImportExtendedW3D.checked ddlPivotType.selection )
+				( cfW3DImporter w3dFiles[i] ckbSplitDependencies.checked rbgAutoBind.state true ckbDebugOutput.checked ckbUseW3DMatl.checked (not ckbIgnoreErrors.checked) ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked ckbUseWWSkin.checked (if ckbUseExternalSkel.checked then externalSkeletonFile else undefined) ckbImportExtendedW3D.checked )
 			)
 		)
 		else
-		( cfW3DImporter undefined ckbSplitDependencies.checked rbgAutoBind.state false ckbDebugOutput.checked ckbUseW3DMatl.checked (not ckbIgnoreErrors.checked) ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked ckbUseWWSkin.checked (if ckbUseExternalSkel.checked then externalSkeletonFile else undefined) ckbImportExtendedW3D.checked ddlPivotType.selection )
+		( cfW3DImporter undefined ckbSplitDependencies.checked rbgAutoBind.state false ckbDebugOutput.checked ckbUseW3DMatl.checked (not ckbIgnoreErrors.checked) ckbFixNormals.checked ckbTga2Dds.checked ckbFixVertices.checked ckbNoMultiMat.checked ckbTga2DdsRev.checked ckbUseWWSkin.checked (if ckbUseExternalSkel.checked then externalSkeletonFile else undefined) ckbImportExtendedW3D.checked )
 	)
 
 	-- enable rev only while tga2DDS is on; uncheck it when tga2DDS is turned off
@@ -4284,7 +6058,7 @@ rollout rltMain "W3D Importer" width:177 height:292
 
 	on ckbSplitDependencies changed state do
 	( if ckbSplitDependencies.checked then ckbAutoBind.checked = false )
-	
+
 	on ckbAutoBind changed state do
 	(
 		if ckbAutoBind.checked then
@@ -4367,7 +6141,8 @@ rollout rltMain "W3D Importer" width:177 height:292
 		ckbAutoBind.visible          = basic
 		rbgAutoBind.visible          = basic
 		ckbBatchProcessing.visible   = basic
-		ddlPivotType.visible         = basic
+		ckbShowBoneFins.visible      = basic
+		ckbPureAnim.visible          = basic
 
 		ckbUseW3DMatl.visible        = not basic
 		ckbDebugOutput.visible       = not basic
@@ -4408,5 +6183,20 @@ rollout rltMain "W3D Importer" width:177 height:292
 			ckbUseW3DMatl.caption = "Use W3D materials (not installed)"
 		)
 	)
+
+	on btnRenegade pressed do
+	(
+		local fname = getOpenFileName caption:"Select Renegade W3D file" \
+			types:"Westwood 3D (*.w3d)|*.w3d|All Files (*.*)|*.*|"
+		if fname == undefined do return undefined
+		try ( destroyDialog rltRenegade ) catch ()
+		-- globals are the only reliable way to pass data into a rollout before createDialog.
+		-- Use ::rnPendingFile to force global-scope assignment from inside the rollout.
+		::rnPendingFile = fname
+		createDialog rltRenegade
+	)
 )
-createDialog rltMain
+
+global rnPendingFile = undefined
+W3DImporterInit.init()
+createDialog rltMain menu:rltMainMenu

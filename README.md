@@ -12,6 +12,15 @@ Tested on 3ds Max 2023.
 
 - [w3dimporter](#w3dimporter)
   - [Usage](#usage)
+  - [Changelog (v20.0 vs v17.1)](#changelog-v200-vs-v171)
+    - [Advanced Renegade Import dialog](#advanced-renegade-import-dialog)
+    - [Preferences and named profiles](#preferences-and-named-profiles)
+    - [Import from Mix (Renegade .mix archives)](#import-from-mix-renegade-mix-archives)
+    - [Pure animation FBX bake](#pure-animation-fbx-bake)
+    - [Prelit chunk wrapper handling](#prelit-chunk-wrapper-handling)
+    - [Compressed animation channels](#compressed-animation-channels)
+    - [Autoload (scripts/startup/) fixes](#autoload-scriptsstartup-fixes)
+    - [Other](#other)
   - [Changelog (v17.1 vs v17)](#changelog-v171-vs-v17)
     - [Use 3dsMax8 Normals removed](#use-3dsmax8-normals-removed)
     - [Fix Normals + Fix Vertices interaction fixed](#fix-normals--fix-vertices-interaction-fixed)
@@ -68,6 +77,59 @@ Tested on 3ds Max 2023.
    - **Advanced** — Use W3D Materials, Debug Output, Import extended W3D Info, Strict Mode, Fix Normals, tga2DDS (with`rev` companion), Fix Vertices, No Multi-Mat, Use 2023WWSkin, Use External Skeleton.
 
 If a runtime error inside an import leaves the dialog's buttons unresponsive, type `w3di.reload()` in the MAXScript Listener to rebuild the dialog.
+
+</details>
+
+<details id="changelog-v200-vs-v171">
+<summary><h2>Changelog (v20.0 vs v17.1)</h2></summary>
+
+Catch-up release: v18 and v19 happened in the local working copy without published tags, so v20.0 bundles all of v18 → v20 plus the autoload fixes from the final cycle.
+
+### Advanced Renegade Import dialog
+
+A new **Advanced Import** button next to *Import a file* opens a per-file Renegade-style inspector (`rltRenegade`) that lists every mesh, proxy, aggregate, and dazzle in the picked `.w3d`. You can:
+
+- Multi-select which meshes / proxies / aggregates to import (rest skipped).
+- Choose a LOD: *All*, an individual LOD index, or *None*.
+- Clamp animation to a custom `[from..to]` frame range, or skip animation entirely.
+- Toggle *Import Bones*, *Bones-only* import, *DepBones only* (keep only the bones referenced by the selected meshes), and *Origin Bone* (add a single Bone at world origin, reparent root pivots under it).
+- Run a Bones-only pass that skips geometry entirely.
+
+### Preferences and named profiles
+
+A new **File > Preferences** dialog (`W3DPreferences`) replaces the old hard-coded Pivots dropdown. Bones, Proxies, Aggregates, and Dazzles each get their own shape (Bone / Sphere / Point Helper), size, and color. The configuration is stored as named profiles in `W3D-Importer.ini` with *Default*, *Default Characters*, and *Default Vehicles* baseline profiles mirroring 1.16b. The Basic-tab Pivots control is gone; the active profile drives everything.
+
+### Import from Mix (Renegade .mix archives)
+
+**File > Select From Mix** opens a Renegade `.mix` archive, lists every `.w3d` inside, lets you multi-select, and extracts + imports each. An optional checkbox routes every extracted file through the Advanced Renegade Import dialog instead of straight import — useful when you want per-file LOD/animation/selection control across a batch.
+
+### Pure animation FBX bake
+
+A new **Pure animation** checkbox on the Basic tab. After import, the importer writes an `.fbx` next to the source `.w3d` (single-file and batch). Useful for baking out anim-only clips for tools that don't read `.w3d`. Requires the FBX exporter plugin.
+
+### Prelit chunk wrapper handling
+
+Meshes containing `W3D_CHUNK_PRELIT_VERTEX` (0x24) now import their materials, shaders, and textures correctly. Previously the wrapper was treated as opaque and the inner `MATERIAL_INFO / SHADERS / VERTEX_MATERIALS / TEXTURES / MATERIAL_PASS` chunks were skipped, leaving prelit meshes (common in Renegade exteriors) with default Standard materials. The lightmap-prelit siblings (`0x23 PRELIT_UNLIT`, `0x25 PRELIT_LIGHTMAP_MULTI_PASS`, `0x26 PRELIT_LIGHTMAP_MULTI_TEXTURE`) are still deliberately skipped — they need real lightmap-texture + secondary-UV handling, not just a wrapper descend.
+
+### Compressed animation channels
+
+The importer now reads `ANIM_MOTION_CHANNEL_DELTA_Q` (compressed-quaternion delta), `ANIM_MOTION_CHANNEL_DELTA_X/Y/Z` (compressed translation deltas), `ANIM_FLAVOUR_TIMECODED` (time-coded keyframes), and `ANIM_FLAVOUR_VALID` channels. Models that ship `W3D_CHUNK_COMPRESSED_ANIMATION` (adaptive-delta or time-coded compressed clips) now animate correctly instead of importing with empty motion.
+
+### Autoload (scripts/startup/) fixes
+
+Dropping `w3dimporter.ms` into `<3dsmax>/scripts/startup/` previously caused two symptoms:
+
+- **Hard error on import.** `cfW3DImporter` references `W3DImporterInit`, which is assigned via `global W3DImporterInit = ...` about 3.5k lines later in the file. Manual drag-drop tolerates this (the editor evaluates the whole buffer in one shared scope so the global is visible everywhere by the time anything runs); startup-folder autoload doesn't (function bodies are compiled before later top-level statements execute, so the name is captured as `undefined` inside `cfW3DImporter`). Result: `Unknown property: "getActive" in undefined` at the first call to `W3DImporterInit.getActive`.
+- **Silent wrong import via Advanced Import.** `rltRenegade.doImport` snapshotted each Advanced-tab checkbox as `try ( rltMain.ckbXxx.checked ) catch ( false )`. Under autoload `rltMain` was likewise undefined inside the earlier-defined `rltRenegade`'s scope, the `.ckbXxx` access threw, the `try` swallowed it, and every advanced option silently fell back to `false`. The imported model looked correct but with every Advanced-tab toggle (Use W3D Materials, Import extended W3D Info, Fix Normals, tga2DDS, etc.) effectively unchecked regardless of the UI state.
+
+Both are fixed by adding forward `global Name` declarations at the top of the file (`W3DImporterInit`, `rnPendingFile`, `rltMain`). MAXScript's `global X` followed by a later `global X = value` is idempotent — the later assignment reuses the same global slot — so manual drag-drop behaviour is unchanged.
+
+### Other
+
+- Bone / proxy / aggregate marker sizes auto-fit from the imported mesh bounding box when the profile's size is `0`.
+- External-skeleton handling: file picker exposed; the picked path survives across multiple imports in the same session.
+- Generals-era HLOD: `lodArrays`, `aggregates`, `proxies` arrays are read out of the HLOD chunk (was previously only `lodArray`).
+- Reload helper unchanged: `w3di.reload()` in the Listener still rebuilds the dialog from a clean state after a runtime error.
 
 </details>
 
